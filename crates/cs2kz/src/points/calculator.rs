@@ -1,34 +1,5 @@
-use std::io;
-use std::time::Duration;
-
-use futures_util::TryFutureExt as _;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::sleep;
-use tokio_util::sync::CancellationToken;
-
-use crate::Config;
 use crate::maps::courses::Tier;
-use crate::points::DistributionParameters;
-use crate::python::Python;
-
-type Message = (Request, oneshot::Sender<Response>);
-
-#[derive(Debug)]
-pub struct PointsCalculator {
-    python: Python<Request, Response>,
-    chan: (mpsc::Sender<Message>, mpsc::Receiver<Message>),
-}
-
-#[derive(Debug, Clone)]
-pub struct PointsCalculatorHandle {
-    chan: mpsc::Sender<Message>,
-}
-
-#[derive(Debug, Display, Error)]
-pub enum Error {
-    #[display("python error")]
-    Python(io::Error),
-}
+use crate::points::{self, NigParams};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Request {
@@ -43,16 +14,9 @@ pub struct Response {
     pub pro_fraction: Option<f64>,
 }
 
-#[derive(Debug, Display, Error)]
-#[display("failed to calculate points ({_variant})")]
-pub enum CalculatePointsError {
-    #[display("calculator unavailable")]
-    CalculatorUnavailable,
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LeaderboardData {
-    pub dist_params: Option<DistributionParameters>,
+    pub dist_params: Option<NigParams>,
     #[serde(serialize_with = "Tier::serialize_as_integer")]
     pub tier: Tier,
     pub leaderboard_size: u64,
@@ -60,76 +24,204 @@ pub struct LeaderboardData {
     pub top_time: f64,
 }
 
-impl PointsCalculator {
-    pub async fn new(config: &Config) -> io::Result<Option<Self>> {
-        let Some(script_path) = config.points.calc_run_path.as_deref() else {
-            tracing::warn!(
-                "no `points.calc-run-path` configured; points calculator will be disabled"
-            );
-            return Ok(None);
-        };
+pub fn calculate(request: &Request) -> Response {
+    let nub_fraction = dist_points_portion(request.time, &request.nub_data);
 
-        let python = Python::new(script_path.to_owned(), config.database.url.clone()).await?;
-        let chan = mpsc::channel(128);
+    let pro_fraction = request.pro_data.as_ref().map(|data| {
+        let pro_fraction = dist_points_portion(request.time, data);
+        pro_fraction.max(nub_fraction)
+    });
 
-        Ok(Some(Self { python, chan }))
+    Response { nub_fraction, pro_fraction }
+}
+
+fn dist_points_portion(time: f64, data: &LeaderboardData) -> f64 {
+    if data.leaderboard_size < points::SMALL_LEADERBOARD_THRESHOLD || data.dist_params.is_none() {
+        return points::for_small_leaderboard(data.tier, data.top_time, time);
     }
 
-    pub fn handle(&self) -> PointsCalculatorHandle {
-        PointsCalculatorHandle { chan: self.chan.0.clone() }
-    }
+    let dist = data.dist_params.expect("checked above");
+    let top_scale = if dist.top_scale > 0.0 { dist.top_scale } else { 1.0 };
+    (nig::nig_survival(dist.a, dist.b, dist.loc, dist.scale, time) / top_scale).clamp(0.0, 1.0)
+}
 
-    #[tracing::instrument(skip_all)]
-    pub async fn run(mut self, cancellation_token: CancellationToken) -> Result<(), Error> {
-        loop {
-            select! {
-                () = cancellation_token.cancelled() => {
-                    tracing::debug!("cancelled");
-                    break Ok(());
-                },
 
-                Some((request, response_tx)) = self.chan.1.recv() => {
-                    let mut attempts = 0;
+/// Input record data for batch recalculation.
+#[derive(Debug, Clone)]
+pub struct BestRecordData {
+    pub record_id: [u8; 16],
+    pub time: f64,
+}
 
-                    if let Err(_err) = loop {
-                        match self.python.send_request(&request).await {
-                            Ok(response) => {
-                                _ = response_tx.send(response);
-                                break Ok(());
-                            },
-                            Err(err) => {
-                                tracing::error!(%err, "failed to execute python request");
-                                self.python.reset().map_err(Error::Python).await?;
+/// Output record with recalculated distribution points fraction.
+#[derive(Debug, Clone)]
+pub struct RecordPoints {
+    pub record_id: [u8; 16],
+    pub points: f64,
+}
 
-                                attempts += 1;
+/// Result of a batch filter recalculation.
+#[derive(Debug, Clone)]
+pub struct RecalculateFilterResult {
+    pub nub_records: Vec<RecordPoints>,
+    pub pro_records: Vec<RecordPoints>,
+    pub nub_params: NigParams,
+    pub pro_params: NigParams,
+    pub nub_fitted: bool,
+    pub pro_fitted: bool,
+}
 
-                                if attempts == 3 {
-                                    break Err(err);
-                                }
+/// Recompute point fractions for all records in a filter
+pub fn recalculate_filter(
+    nub_records: &[BestRecordData],
+    pro_records: &[BestRecordData],
+    nub_tier: Tier,
+    pro_tier: Tier,
+    prev_nub_params: Option<&NigParams>,
+    prev_pro_params: Option<&NigParams>,
+) -> RecalculateFilterResult {
+    let zero_params =
+        NigParams { a: 0.0, b: 0.0, loc: 0.0, scale: 0.0, top_scale: 0.0 };
 
-                                sleep(Duration::from_secs(1)).await;
-                            },
-                        }
-                    } {
-                        tracing::error!("giving up after 3 failed attempts");
-                    }
-                },
-            };
+    let nub_times: Vec<f64> = nub_records.iter().map(|r| r.time).collect();
+    let (nub_params, nub_fitted) = if nub_times.len() >= 50 {
+        let prev = prev_nub_params.copied();
+        let result = nig::fit_nig(&nub_times, prev.as_ref());
+        if result.valid {
+            (result.params, true)
+        } else {
+            (zero_params, false)
         }
+    } else {
+        (zero_params, false)
+    };
+
+    let nub_wr = nub_times.first().copied().unwrap_or(0.0);
+    let nub_leaderboard = LeaderboardData {
+        dist_params: if nub_fitted { Some(nub_params) } else { None },
+        tier: nub_tier,
+        leaderboard_size: nub_records.len() as u64,
+        top_time: nub_wr,
+    };
+
+    let new_nub_records: Vec<RecordPoints> = nub_records
+        .iter()
+        .map(|r| RecordPoints {
+            record_id: r.record_id,
+            points: dist_points_portion(r.time, &nub_leaderboard),
+        })
+        .collect();
+
+    let pro_times: Vec<f64> = pro_records.iter().map(|r| r.time).collect();
+    let (pro_params, pro_fitted) = if pro_times.len() >= 50 {
+        let prev = prev_pro_params.copied();
+        let result = nig::fit_nig(&pro_times, prev.as_ref());
+        if result.valid {
+            (result.params, true)
+        } else {
+            (zero_params, false)
+        }
+    } else {
+        (zero_params, false)
+    };
+
+    let pro_wr = pro_times.first().copied().unwrap_or(0.0);
+    let pro_leaderboard = LeaderboardData {
+        dist_params: if pro_fitted { Some(pro_params) } else { None },
+        tier: pro_tier,
+        leaderboard_size: pro_records.len() as u64,
+        top_time: pro_wr,
+    };
+
+    let new_pro_records: Vec<RecordPoints> = pro_records
+        .iter()
+        .map(|r| {
+            let pro_fraction = dist_points_portion(r.time, &pro_leaderboard);
+            let nub_fraction = dist_points_portion(r.time, &nub_leaderboard);
+            RecordPoints {
+                record_id: r.record_id,
+                points: pro_fraction.max(nub_fraction),
+            }
+        })
+        .collect();
+
+    RecalculateFilterResult {
+        nub_records: new_nub_records,
+        pro_records: new_pro_records,
+        nub_params,
+        pro_params,
+        nub_fitted,
+        pro_fitted,
     }
 }
 
-impl PointsCalculatorHandle {
-    pub async fn calculate(&self, request: Request) -> Result<Response, CalculatePointsError> {
-        let (response_tx, response_rx) = oneshot::channel::<Response>();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        if let Err(_send_err) = self.chan.send((request, response_tx)).await {
-            return Err(CalculatePointsError::CalculatorUnavailable);
-        }
+    fn assert_abs_close(actual: f64, expected: f64, tolerance: f64) {
+        let abs_error = (actual - expected).abs();
+        assert!(
+            abs_error <= tolerance,
+            "expected {expected:.15e}, got {actual:.15e}, abs error {abs_error:.2e}",
+        );
+    }
 
-        match response_rx.await {
-            Ok(response) => Ok(response),
-            Err(_recv_err) => Err(CalculatePointsError::CalculatorUnavailable),
-        }
+    #[test]
+    fn calculate_points_matches_python_example() {
+        let request = Request {
+            time: 8.609375,
+            nub_data: LeaderboardData {
+                dist_params: Some(NigParams {
+                    a: 33.53900289787477,
+                    b: 33.52140111667502,
+                    loc: 6.3663207368487065,
+                    scale: 0.4480388195262859,
+                    top_scale: 0.9979285278452101,
+                }),
+                tier: Tier::VeryEasy,
+                leaderboard_size: 224,
+                top_time: 7.6484375,
+            },
+            pro_data: Some(LeaderboardData {
+                dist_params: Some(NigParams {
+                    a: 2.6294814553333743,
+                    b: 2.511121972118702,
+                    loc: 8.713014153227697,
+                    scale: 2.2226724397990805,
+                    top_scale: 0.9952929135343108,
+                }),
+                tier: Tier::VeryEasy,
+                leaderboard_size: 165,
+                top_time: 7.6484375,
+            }),
+        };
+
+        let response = calculate(&request);
+        assert_abs_close(response.nub_fraction, 0.9745534941686896, 1e-3);
+        assert_abs_close(response.pro_fraction.expect("pro fraction"), 0.9760910013054752, 1e-3);
+    }
+
+    #[test]
+    fn pro_fraction_is_never_less_than_nub_fraction() {
+        let request = Request {
+            time: 8.0,
+            nub_data: LeaderboardData {
+                dist_params: None,
+                tier: Tier::VeryEasy,
+                leaderboard_size: 30,
+                top_time: 7.0,
+            },
+            pro_data: Some(LeaderboardData {
+                dist_params: None,
+                tier: Tier::Death,
+                leaderboard_size: 30,
+                top_time: 7.0,
+            }),
+        };
+
+        let response = calculate(&request);
+        assert!(response.pro_fraction.is_some());
+        assert!(response.pro_fraction.unwrap() >= response.nub_fraction);
     }
 }

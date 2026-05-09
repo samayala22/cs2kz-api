@@ -1,17 +1,16 @@
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryFutureExt as _;
+use sqlx::Row as _;
 use tokio::sync::Notify;
-use tokio::time::{interval, sleep};
+use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 use crate::maps::CourseFilterId;
-use crate::maps::courses::filters::GetCourseFiltersError;
 use crate::mode::Mode;
-use crate::python::Python;
-use crate::records::GetRecordsError;
+use crate::points::calculator;
+use crate::points::NigParams;
 use crate::{Context, database, players};
 
 #[derive(Debug, Clone)]
@@ -39,10 +38,8 @@ struct Notifications {
 
 #[derive(Debug, Display, Error, From)]
 pub enum Error {
-    GetCourseFilter(GetCourseFiltersError),
-    GetRecords(GetRecordsError),
     DetermineFilterToRecalculate(DetermineFilterToRecalculateError),
-    Python(io::Error),
+    ProcessFilter(database::Error),
 }
 
 #[derive(Debug, Display, Error, From)]
@@ -50,54 +47,8 @@ pub enum Error {
 #[from(forward)]
 pub struct DetermineFilterToRecalculateError(database::Error);
 
-#[derive(Debug, serde::Serialize)]
-struct PythonRequest {
-    filter_id: CourseFilterId,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PythonResponse {
-    #[expect(dead_code, reason = "included in tracing events")]
-    filter_id: CourseFilterId,
-
-    #[expect(dead_code, reason = "included in tracing events")]
-    timings: PythonTimings,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[expect(dead_code, reason = "included in tracing events")]
-struct PythonTimings {
-    #[serde(rename = "db_query_ms", deserialize_with = "deserialize_millis")]
-    db_query: Duration,
-
-    #[serde(rename = "nub_fit_ms", deserialize_with = "deserialize_millis")]
-    nub_fit: Duration,
-
-    #[serde(rename = "nub_compute_ms", deserialize_with = "deserialize_millis")]
-    nub_compute: Duration,
-
-    #[serde(rename = "pro_fit_ms", deserialize_with = "deserialize_millis")]
-    pro_fit: Duration,
-
-    #[serde(rename = "pro_compute_ms", deserialize_with = "deserialize_millis")]
-    pro_compute: Duration,
-
-    #[serde(rename = "db_write_ms", deserialize_with = "deserialize_millis")]
-    db_write: Duration,
-}
-
 #[tracing::instrument(skip_all, err)]
 pub async fn run(cx: Context, cancellation_token: CancellationToken) -> Result<(), Error> {
-    let Some(script_path) = cx.config().points.calc_filter_path.as_deref() else {
-        tracing::warn!("no `points.calc-filter-path` configured; points daemon will be disabled");
-        return Ok(());
-    };
-
-    let mut python = Python::<PythonRequest, PythonResponse>::new(
-        script_path.to_owned(),
-        cx.config().database.url.clone(),
-    )
-    .await?;
     let mut recalc_ratings_interval = interval(Duration::from_secs(10));
 
     loop {
@@ -114,7 +65,7 @@ pub async fn run(cx: Context, cancellation_token: CancellationToken) -> Result<(
 
             res = determine_filter_to_recalculate(&cx) => {
                 let (filter_id, priority) = res?;
-                process_filter(&mut python, &cancellation_token, filter_id).await?;
+                process_filter(&cx, &cancellation_token, filter_id).await?;
                 update_filters_to_recalculate(&cx, filter_id, priority).await;
             },
         };
@@ -184,42 +135,198 @@ async fn update_filters_to_recalculate(
     }
 }
 
-#[tracing::instrument(skip(python))]
-async fn process_filter(
-    python: &mut Python<PythonRequest, PythonResponse>,
-    cancellation_token: &CancellationToken,
-    filter_id: CourseFilterId,
-) -> Result<(), Error> {
-    let request = PythonRequest { filter_id };
-
-    loop {
-        tracing::debug!(?request);
-        match cancellation_token
-            .run_until_cancelled(python.send_request(&request))
-            .await
-        {
-            None => {
-                tracing::debug!("cancelled");
-                break Ok(());
-            },
-            Some(Ok(response)) => {
-                tracing::debug!(?response);
-                break Ok(());
-            },
-            Some(Err(err)) => {
-                tracing::error!(%err, "failed to execute python request");
-                python.reset().map_err(Error::Python).await?;
-                sleep(Duration::from_secs(1)).await;
-            },
-        }
-    }
+/// Holds DB-fetched record data for native recalculation.
+#[derive(Debug)]
+struct DbRecord {
+    record_id: [u8; 16],
+    time: f64,
 }
 
-fn deserialize_millis<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    <f64 as serde::Deserialize<'de>>::deserialize(deserializer)
-        .map(|millis| millis / 1000.0)
-        .map(Duration::from_secs_f64)
+#[tracing::instrument(skip(cx, cancellation_token))]
+async fn process_filter(
+    cx: &Context,
+    cancellation_token: &CancellationToken,
+    filter_id: CourseFilterId,
+) -> Result<(), database::Error> {
+    tracing::debug!(%filter_id, "recalculating filter natively");
+
+    let db = cx.database().as_ref();
+
+    // Nub records (sorted by time ASC)
+    let nub_rows = sqlx::query(
+        "SELECT record_id, time FROM BestNubRecords WHERE filter_id = ? ORDER BY time ASC"
+    )
+    .bind(filter_id)
+    .fetch_all(db)
+    .await?;
+
+    // Pro records (sorted by time ASC)
+    let pro_rows = sqlx::query(
+        "SELECT record_id, time FROM BestProRecords WHERE filter_id = ? ORDER BY time ASC"
+    )
+    .bind(filter_id)
+    .fetch_all(db)
+    .await?;
+
+    // Filter tiers
+    let tiers_row = sqlx::query(
+        "SELECT nub_tier, pro_tier FROM CourseFilters WHERE id = ?"
+    )
+    .bind(filter_id)
+    .fetch_optional(db)
+    .await?;
+
+    let Some(tiers_row) = tiers_row else {
+        tracing::warn!(%filter_id, "filter not found in CourseFilters");
+        return Ok(());
+    };
+
+    let nub_tier: crate::maps::courses::Tier = tiers_row.try_get(0)?;
+    let pro_tier: crate::maps::courses::Tier = tiers_row.try_get(1)?;
+
+    // Previous distribution parameters for warm start
+    let prev_nub_row = sqlx::query(
+        "SELECT a, b, loc, scale, top_scale
+         FROM PointDistributionData
+         WHERE filter_id = ? AND (NOT is_pro_leaderboard)"
+    )
+    .bind(filter_id)
+    .fetch_optional(db)
+    .await?;
+
+    let prev_nub_params = prev_nub_row.map(|row| NigParams {
+        a: row.get(0),
+        b: row.get(1),
+        loc: row.get(2),
+        scale: row.get(3),
+        top_scale: row.get(4),
+    });
+
+    let prev_pro_row = sqlx::query(
+        "SELECT a, b, loc, scale, top_scale
+         FROM PointDistributionData
+         WHERE filter_id = ? AND is_pro_leaderboard"
+    )
+    .bind(filter_id)
+    .fetch_optional(db)
+    .await?;
+
+    let prev_pro_params = prev_pro_row.map(|row| NigParams {
+        a: row.get(0),
+        b: row.get(1),
+        loc: row.get(2),
+        scale: row.get(3),
+        top_scale: row.get(4),
+    });
+
+    let nub_records: Vec<DbRecord> = nub_rows.iter().map(|row| {
+        let bytes: &[u8] = row.get(0);
+        let mut id = [0u8; 16];
+        id.copy_from_slice(bytes);
+        DbRecord { record_id: id, time: row.get(1) }
+    }).collect();
+    let pro_records: Vec<DbRecord> = pro_rows.iter().map(|row| {
+        let bytes: &[u8] = row.get(0);
+        let mut id = [0u8; 16];
+        id.copy_from_slice(bytes);
+        DbRecord { record_id: id, time: row.get(1) }
+    }).collect();
+
+    let nub_recs: Vec<calculator::BestRecordData> = nub_records.iter().map(|r|
+        calculator::BestRecordData { record_id: r.record_id, time: r.time }
+    ).collect();
+    let pro_recs: Vec<calculator::BestRecordData> = pro_records.iter().map(|r|
+        calculator::BestRecordData { record_id: r.record_id, time: r.time }
+    ).collect();
+
+    // heavy calcs on blocking thread
+    let result = tokio::task::spawn_blocking(move || {
+        calculator::recalculate_filter(
+            &nub_recs,
+            &pro_recs,
+            nub_tier,
+            pro_tier,
+            prev_nub_params.as_ref(),
+            prev_pro_params.as_ref(),
+        )
+    });
+
+    let result = cancellation_token
+        .run_until_cancelled(result)
+        .await
+        .ok_or_else(|| {
+            database::Error::decode(std::io::Error::other("points recalculation cancelled"))
+        })
+        .and_then(|res| res.map_err(database::Error::decode))?;
+
+    tracing::debug!(
+        %filter_id,
+        nub_fitted = result.nub_fitted,
+        pro_fitted = result.pro_fitted,
+        "recalculation complete, writing to DB"
+    );
+
+    for record in &result.nub_records {
+        sqlx::query("UPDATE BestNubRecords SET points = ? WHERE record_id = ?")
+            .bind(record.points)
+            .bind(record.record_id.as_slice())
+            .execute(db)
+            .await?;
+    }
+
+    for record in &result.pro_records {
+        sqlx::query("UPDATE BestProRecords SET points = ? WHERE record_id = ?")
+            .bind(record.points)
+            .bind(record.record_id.as_slice())
+            .execute(db)
+            .await?;
+    }
+
+    if result.nub_fitted {
+        sqlx::query(
+            "INSERT INTO PointDistributionData (
+                filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
+             )
+             VALUES (?, FALSE, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+                a = VALUES(a),
+                b = VALUES(b),
+                loc = VALUES(loc),
+                scale = VALUES(scale),
+                top_scale = VALUES(top_scale)"
+        )
+        .bind(filter_id)
+        .bind(result.nub_params.a)
+        .bind(result.nub_params.b)
+        .bind(result.nub_params.loc)
+        .bind(result.nub_params.scale)
+        .bind(result.nub_params.top_scale)
+        .execute(db)
+        .await?;
+    }
+
+    if result.pro_fitted {
+        sqlx::query(
+            "INSERT INTO PointDistributionData (
+                filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
+             )
+             VALUES (?, TRUE, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+                a = VALUES(a),
+                b = VALUES(b),
+                loc = VALUES(loc),
+                scale = VALUES(scale),
+                top_scale = VALUES(top_scale)"
+        )
+        .bind(filter_id)
+        .bind(result.pro_params.a)
+        .bind(result.pro_params.b)
+        .bind(result.pro_params.loc)
+        .bind(result.pro_params.scale)
+        .bind(result.pro_params.top_scale)
+        .execute(db)
+        .await?;
+    }
+
+    Ok(())
 }

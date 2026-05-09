@@ -3,23 +3,13 @@ use crate::maps::courses::Tier;
 pub mod daemon;
 pub mod calculator;
 
+pub use nig::NigParams;
+
 /// The maximum points for any record.
 pub const MAX: f64 = 10_000.0;
 
 /// Threshold for what counts as a "small" leaderboard.
 pub const SMALL_LEADERBOARD_THRESHOLD: u64 = 50;
-
-/// [Normal-inverse Gaussian distribution][norminvgauss] parameters.
-///
-/// [norminvgauss]: https://en.wikipedia.org/wiki/Normal-inverse_Gaussian_distribution
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct DistributionParameters {
-    pub a: f64,
-    pub b: f64,
-    pub loc: f64,
-    pub scale: f64,
-    pub top_scale: f64,
-}
 
 /// "Completes" pre-calculated distribution points cached in the database.
 ///

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use std::{fmt, io};
+use std::fmt;
 
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -25,7 +25,6 @@ mod inner {
         pub(super) database: Database,
         pub(super) shutdown_token: CancellationToken,
         pub(super) tasks: TaskTracker,
-        pub(super) points_calculator: Option<points::calculator::PointsCalculatorHandle>,
         pub(super) points_daemon: points::daemon::PointsDaemonHandle,
     }
 }
@@ -41,9 +40,6 @@ pub enum InitializeContextError {
 
     #[display("failed to run database migrations: {_0}")]
     RunDatabaseMigrations(sqlx::migrate::MigrateError),
-
-    #[display("failed to initialize points calculator: {_0}")]
-    InitializePointsCalculator(io::Error),
 }
 
 impl Context {
@@ -71,20 +67,6 @@ impl Context {
         database::MIGRATIONS.run(database.as_ref()).await?;
 
         let tasks = TaskTracker::new();
-        let points_calculator = points::calculator::PointsCalculator::new(&config)
-            .await?
-            .map(|calc| {
-                let handle = calc.handle();
-                let cancellation_token = shutdown_token.child_token();
-                let task = tasks.track_future(calc.run(cancellation_token));
-
-                task::Builder::new()
-                    .name("cs2kz::points_calculator")
-                    .spawn(task)
-                    .expect("failed to spawn tokio task");
-
-                handle
-            });
         let points_daemon = points::daemon::PointsDaemonHandle::new();
 
         Ok(Self(Arc::new(inner::Context {
@@ -92,7 +74,6 @@ impl Context {
             database,
             shutdown_token,
             tasks,
-            points_calculator,
             points_daemon,
         })))
     }
@@ -103,10 +84,6 @@ impl Context {
 
     pub(crate) fn database(&self) -> &Database {
         &self.0.database
-    }
-
-    pub fn points_calculator(&self) -> Option<&points::calculator::PointsCalculatorHandle> {
-        self.0.points_calculator.as_ref()
     }
 
     pub fn points_daemon(&self) -> &points::daemon::PointsDaemonHandle {

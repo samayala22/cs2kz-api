@@ -14,12 +14,8 @@ use crate::num::AsF64;
 use crate::pagination::{Limit, Offset, Paginated};
 use crate::players::{CalculateRatingError, PlayerId, PlayerInfo};
 use crate::plugin::PluginVersionId;
-use crate::points::calculator::{
-    CalculatePointsError,
-    Request as CalculatePointsRequest,
-    Response as CalculatePointsResponse,
-};
-use crate::points::{self, DistributionParameters};
+use crate::points::calculator::{self, Request as CalculatePointsRequest, Response as CalculatePointsResponse};
+use crate::points::{self, NigParams};
 use crate::servers::{ServerId, ServerInfo};
 use crate::styles::{ClientStyleInfo, Styles};
 use crate::time::Seconds;
@@ -195,10 +191,6 @@ pub struct SubmittedPB {
 pub enum SubmitRecordError {
     #[display("{_0}")]
     #[from]
-    CalculatePoints(CalculatePointsError),
-
-    #[display("{_0}")]
-    #[from]
     CalculateRating(CalculateRatingError),
 
     #[display("{_0}")]
@@ -284,7 +276,7 @@ pub async fn submit(
             .await?;
 
             let nub_dist = sqlx::query_as!(
-                DistributionParameters,
+                NigParams,
                 "SELECT a, b, loc, scale, top_scale
                  FROM PointDistributionData
                  WHERE filter_id = ?
@@ -337,7 +329,7 @@ pub async fn submit(
 
             let pro_data = if teleports == 0 {
                 let pro_dist = sqlx::query_as!(
-                    DistributionParameters,
+                    NigParams,
                     "SELECT a, b, loc, scale, top_scale
                      FROM PointDistributionData
                      WHERE filter_id = ?
@@ -384,7 +376,6 @@ pub async fn submit(
 
             let points = if nub_leaderboard_size > points::SMALL_LEADERBOARD_THRESHOLD
                 && nub_data.dist_params.is_some()
-                && let Some(calc) = cx.points_calculator()
             {
                 let request = CalculatePointsRequest {
                     time: time.as_f64(),
@@ -392,7 +383,7 @@ pub async fn submit(
                     pro_data: pro_data.clone().filter(|data| data.dist_params.is_some()),
                 };
 
-                let mut response = calc.calculate(request.clone()).await?;
+                let mut response = calculator::calculate(&request);
 
                 if let Some(ref pro_data) = pro_data && request.pro_data.is_none() {
                     response.pro_fraction = Some(points::for_small_leaderboard(

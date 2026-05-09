@@ -765,6 +765,7 @@ dependencies = [
  "futures-util",
  "lettre",
  "md-5",
+ "nig",
  "pin-project",
  "rust-s3",
  "semver",
@@ -1883,6 +1884,13 @@ dependencies = [
  "libc",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "nig"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
