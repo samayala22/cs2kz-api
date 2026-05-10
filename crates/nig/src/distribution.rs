@@ -33,7 +33,13 @@ pub(crate) fn nig_pdf(a: f64, b: f64, mu: f64, delta: f64, x: f64) -> f64 {
 }
 
 // Adapted from C code from https://en.wikipedia.org/wiki/Adaptive_Simpson%27s_method
-pub(crate) fn adaptive_simpson(f: impl Fn(f64) -> f64 + Copy, a: f64, b: f64, eps: f64, max_depth: u32) -> Option<f64> {
+pub(crate) fn adaptive_simpson(
+    mut f: impl FnMut(f64) -> f64,
+    a: f64,
+    b: f64,
+    eps: f64,
+    max_depth: u32,
+) -> Option<f64> {
     if a == b {
         return Some(0.0);
     }
@@ -43,11 +49,11 @@ pub(crate) fn adaptive_simpson(f: impl Fn(f64) -> f64 + Copy, a: f64, b: f64, ep
     let fb = f(b);
     let fm = f((a + b) / 2.0);
     let whole = (h / 6.0) * (fa + 4.0 * fm + fb);
-    adaptive_simpson_rec(f, a, b, eps, whole, fa, fb, fm, max_depth)
+    adaptive_simpson_rec(&mut f, a, b, eps, whole, fa, fb, fm, max_depth)
 }
 
 fn adaptive_simpson_rec(
-    f: impl Fn(f64) -> f64 + Copy,
+    f: &mut impl FnMut(f64) -> f64,
     a: f64,
     b: f64,
     eps: f64,
@@ -78,8 +84,8 @@ fn adaptive_simpson_rec(
     }
 
     Some(
-        adaptive_simpson_rec(f, a, m, eps / 2.0, left, fa, fm, flm, depth - 1)?
-        + adaptive_simpson_rec(f, m, b, eps / 2.0, right, fm, fb, frm, depth - 1)?,
+        adaptive_simpson_rec(&mut *f, a, m, eps / 2.0, left, fa, fm, flm, depth - 1)?
+        + adaptive_simpson_rec(&mut *f, m, b, eps / 2.0, right, fm, fb, frm, depth - 1)?,
     )
 }
 

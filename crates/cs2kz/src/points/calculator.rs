@@ -1,5 +1,6 @@
 use crate::maps::courses::Tier;
 use crate::points::{self, NigParams};
+use crate::records::RecordId;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Request {
@@ -24,39 +25,17 @@ pub struct LeaderboardData {
     pub top_time: f64,
 }
 
-pub fn calculate(request: &Request) -> Response {
-    let nub_fraction = dist_points_portion(request.time, &request.nub_data);
-
-    let pro_fraction = request.pro_data.as_ref().map(|data| {
-        let pro_fraction = dist_points_portion(request.time, data);
-        pro_fraction.max(nub_fraction)
-    });
-
-    Response { nub_fraction, pro_fraction }
-}
-
-fn dist_points_portion(time: f64, data: &LeaderboardData) -> f64 {
-    if data.leaderboard_size < points::SMALL_LEADERBOARD_THRESHOLD || data.dist_params.is_none() {
-        return points::for_small_leaderboard(data.tier, data.top_time, time);
-    }
-
-    let dist = data.dist_params.expect("checked above");
-    let top_scale = if dist.top_scale > 0.0 { dist.top_scale } else { 1.0 };
-    (nig::nig_survival(dist.a, dist.b, dist.loc, dist.scale, time) / top_scale).clamp(0.0, 1.0)
-}
-
-
 /// Input record data for batch recalculation.
 #[derive(Debug, Clone)]
 pub struct BestRecordData {
-    pub record_id: [u8; 16],
+    pub record_id: RecordId,
     pub time: f64,
 }
 
 /// Output record with recalculated distribution points fraction.
 #[derive(Debug, Clone)]
 pub struct RecordPoints {
-    pub record_id: [u8; 16],
+    pub record_id: RecordId,
     pub points: f64,
 }
 
@@ -69,6 +48,29 @@ pub struct RecalculateFilterResult {
     pub pro_params: NigParams,
     pub nub_fitted: bool,
     pub pro_fitted: bool,
+}
+
+pub fn calculate(request: &Request) -> Response {
+    let nub_fraction = dist_points_portion(request.time, &request.nub_data);
+
+    let pro_fraction = request.pro_data.as_ref().map(|data| {
+        let pro_fraction = dist_points_portion(request.time, data);
+        f64::max(pro_fraction, nub_fraction)
+    });
+
+    Response { nub_fraction, pro_fraction }
+}
+
+fn dist_points_portion(time: f64, data: &LeaderboardData) -> f64 {
+    if data.leaderboard_size < points::SMALL_LEADERBOARD_THRESHOLD {
+        return points::for_small_leaderboard(data.tier, data.top_time, time);
+    }
+
+    let Some(dist) = data.dist_params else {
+        return points::for_small_leaderboard(data.tier, data.top_time, time);
+    };
+    let top_scale = if dist.top_scale > 0.0 { dist.top_scale } else { 1.0 };
+    (nig::nig_survival(dist.a, dist.b, dist.loc, dist.scale, time) / top_scale).clamp(0.0, 1.0)
 }
 
 /// Recompute point fractions for all records in a filter
@@ -98,7 +100,7 @@ pub fn recalculate_filter(
 
     let nub_wr = nub_times.first().copied().unwrap_or(0.0);
     let nub_leaderboard = LeaderboardData {
-        dist_params: if nub_fitted { Some(nub_params) } else { None },
+        dist_params: nub_fitted.then_some(nub_params),
         tier: nub_tier,
         leaderboard_size: nub_records.len() as u64,
         top_time: nub_wr,
@@ -127,7 +129,7 @@ pub fn recalculate_filter(
 
     let pro_wr = pro_times.first().copied().unwrap_or(0.0);
     let pro_leaderboard = LeaderboardData {
-        dist_params: if pro_fitted { Some(pro_params) } else { None },
+        dist_params: pro_fitted.then_some(pro_params),
         tier: pro_tier,
         leaderboard_size: pro_records.len() as u64,
         top_time: pro_wr,
@@ -140,7 +142,7 @@ pub fn recalculate_filter(
             let nub_fraction = dist_points_portion(r.time, &nub_leaderboard);
             RecordPoints {
                 record_id: r.record_id,
-                points: pro_fraction.max(nub_fraction),
+                points: f64::max(pro_fraction, nub_fraction),
             }
         })
         .collect();

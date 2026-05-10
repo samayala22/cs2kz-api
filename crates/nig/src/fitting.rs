@@ -2,12 +2,12 @@ use crate::bessel::bessel_k1;
 use crate::distribution::nig_survival;
 use crate::params::{FitResult, NigParams};
 
-pub(crate) fn central_diff<F: Fn(f64) -> f64>(f: F, x0: f64) -> f64 {
+pub(crate) fn central_diff(mut f: impl FnMut(f64) -> f64, x0: f64) -> f64 {
     let eps = f64::EPSILON;
-    let h = (eps.cbrt() * x0.abs()).max(eps);
+    let h = eps.cbrt() * x0.abs().max(1.0); // https://docs.sciml.ai/FiniteDiff/dev/epsilons/
     let x_plus = x0 + h;
     let x_minus = x0 - h;
-    let denom = x_plus - x_minus; // NOT 2*h — preserves floating-point nuance
+    let denom = x_plus - x_minus; // representable floating point nb (not same as 2h)
     (f(x_plus) - f(x_minus)) / denom
 }
 

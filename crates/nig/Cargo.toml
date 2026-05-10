@@ -2,7 +2,7 @@
 name = "nig"
 version = "0.1.0"
 authors = ["Praetor"]
-edition = 2026
+edition.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license = "AGPL-3.0-only"

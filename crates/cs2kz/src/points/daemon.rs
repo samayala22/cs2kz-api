@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use futures_util::TryFutureExt as _;
@@ -8,9 +9,9 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 use crate::maps::CourseFilterId;
+use crate::maps::courses::Tier;
 use crate::mode::Mode;
-use crate::points::calculator;
-use crate::points::NigParams;
+use crate::points::{NigParams, calculator};
 use crate::{Context, database, players};
 
 #[derive(Debug, Clone)]
@@ -65,7 +66,7 @@ pub async fn run(cx: Context, cancellation_token: CancellationToken) -> Result<(
 
             res = determine_filter_to_recalculate(&cx) => {
                 let (filter_id, priority) = res?;
-                process_filter(&cx, &cancellation_token, filter_id).await?;
+                process_filter(&cx, filter_id).await?;
                 update_filters_to_recalculate(&cx, filter_id, priority).await;
             },
         };
@@ -135,60 +136,73 @@ async fn update_filters_to_recalculate(
     }
 }
 
-/// Holds DB-fetched record data for native recalculation.
-#[derive(Debug)]
-struct DbRecord {
-    record_id: [u8; 16],
-    time: f64,
-}
-
-#[tracing::instrument(skip(cx, cancellation_token))]
-async fn process_filter(
-    cx: &Context,
-    cancellation_token: &CancellationToken,
-    filter_id: CourseFilterId,
-) -> Result<(), database::Error> {
-    tracing::debug!(%filter_id, "recalculating filter natively");
+#[tracing::instrument(skip(cx))]
+async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), database::Error> {
+    tracing::debug!(%filter_id, "recalculating filter");
 
     let db = cx.database().as_ref();
 
     // Nub records (sorted by time ASC)
     let nub_rows = sqlx::query(
-        "SELECT record_id, time FROM BestNubRecords WHERE filter_id = ? ORDER BY time ASC"
+        "SELECT record_id, time
+         FROM BestNubRecords
+         WHERE filter_id = ?
+         ORDER BY time ASC",
     )
     .bind(filter_id)
     .fetch_all(db)
     .await?;
+
+    let nub_recs: Vec<calculator::BestRecordData> = nub_rows
+        .iter()
+        .map(|row| {
+            Ok(calculator::BestRecordData {
+                record_id: row.try_get(0)?,
+                time: row.try_get(1)?,
+            })
+        })
+        .collect::<Result<_, database::Error>>()?;
 
     // Pro records (sorted by time ASC)
     let pro_rows = sqlx::query(
-        "SELECT record_id, time FROM BestProRecords WHERE filter_id = ? ORDER BY time ASC"
+        "SELECT record_id, time
+         FROM BestProRecords
+         WHERE filter_id = ?
+         ORDER BY time ASC",
     )
     .bind(filter_id)
     .fetch_all(db)
     .await?;
 
+    let pro_recs: Vec<calculator::BestRecordData> = pro_rows
+        .iter()
+        .map(|row| {
+            Ok(calculator::BestRecordData {
+                record_id: row.try_get(0)?,
+                time: row.try_get(1)?,
+            })
+        })
+        .collect::<Result<_, database::Error>>()?;
+
     // Filter tiers
-    let tiers_row = sqlx::query(
-        "SELECT nub_tier, pro_tier FROM CourseFilters WHERE id = ?"
-    )
-    .bind(filter_id)
-    .fetch_optional(db)
-    .await?;
+    let tiers_row = sqlx::query("SELECT nub_tier, pro_tier FROM CourseFilters WHERE id = ?")
+        .bind(filter_id)
+        .fetch_optional(db)
+        .await?;
 
     let Some(tiers_row) = tiers_row else {
         tracing::warn!(%filter_id, "filter not found in CourseFilters");
         return Ok(());
     };
 
-    let nub_tier: crate::maps::courses::Tier = tiers_row.try_get(0)?;
-    let pro_tier: crate::maps::courses::Tier = tiers_row.try_get(1)?;
+    let nub_tier: Tier = tiers_row.try_get(0)?;
+    let pro_tier: Tier = tiers_row.try_get(1)?;
 
     // Previous distribution parameters for warm start
     let prev_nub_row = sqlx::query(
         "SELECT a, b, loc, scale, top_scale
          FROM PointDistributionData
-         WHERE filter_id = ? AND (NOT is_pro_leaderboard)"
+         WHERE filter_id = ? AND (NOT is_pro_leaderboard)",
     )
     .bind(filter_id)
     .fetch_optional(db)
@@ -205,7 +219,7 @@ async fn process_filter(
     let prev_pro_row = sqlx::query(
         "SELECT a, b, loc, scale, top_scale
          FROM PointDistributionData
-         WHERE filter_id = ? AND is_pro_leaderboard"
+         WHERE filter_id = ? AND is_pro_leaderboard",
     )
     .bind(filter_id)
     .fetch_optional(db)
@@ -219,45 +233,31 @@ async fn process_filter(
         top_scale: row.get(4),
     });
 
-    let nub_records: Vec<DbRecord> = nub_rows.iter().map(|row| {
-        let bytes: &[u8] = row.get(0);
-        let mut id = [0u8; 16];
-        id.copy_from_slice(bytes);
-        DbRecord { record_id: id, time: row.get(1) }
-    }).collect();
-    let pro_records: Vec<DbRecord> = pro_rows.iter().map(|row| {
-        let bytes: &[u8] = row.get(0);
-        let mut id = [0u8; 16];
-        id.copy_from_slice(bytes);
-        DbRecord { record_id: id, time: row.get(1) }
-    }).collect();
+    // heavy calcs on dedicated thread
+    let (tx, rx) = tokio::sync::oneshot::channel();
 
-    let nub_recs: Vec<calculator::BestRecordData> = nub_records.iter().map(|r|
-        calculator::BestRecordData { record_id: r.record_id, time: r.time }
-    ).collect();
-    let pro_recs: Vec<calculator::BestRecordData> = pro_records.iter().map(|r|
-        calculator::BestRecordData { record_id: r.record_id, time: r.time }
-    ).collect();
+    thread::spawn({
+        let nub_recs = nub_recs.clone();
+        let pro_recs = pro_recs.clone();
+        let prev_nub_params = prev_nub_params;
+        let prev_pro_params = prev_pro_params;
 
-    // heavy calcs on blocking thread
-    let result = tokio::task::spawn_blocking(move || {
-        calculator::recalculate_filter(
-            &nub_recs,
-            &pro_recs,
-            nub_tier,
-            pro_tier,
-            prev_nub_params.as_ref(),
-            prev_pro_params.as_ref(),
-        )
+        move || {
+            let result = calculator::recalculate_filter(
+                &nub_recs,
+                &pro_recs,
+                nub_tier,
+                pro_tier,
+                prev_nub_params.as_ref(),
+                prev_pro_params.as_ref(),
+            );
+            let _ = tx.send(result);
+        }
     });
 
-    let result = cancellation_token
-        .run_until_cancelled(result)
-        .await
-        .ok_or_else(|| {
-            database::Error::decode(std::io::Error::other("points recalculation cancelled"))
-        })
-        .and_then(|res| res.map_err(database::Error::decode))?;
+    let result = rx.await.map_err(|_| {
+        database::Error::decode(std::io::Error::other("points recalculation thread panicked"))
+    })?;
 
     tracing::debug!(
         %filter_id,
@@ -269,7 +269,7 @@ async fn process_filter(
     for record in &result.nub_records {
         sqlx::query("UPDATE BestNubRecords SET points = ? WHERE record_id = ?")
             .bind(record.points)
-            .bind(record.record_id.as_slice())
+            .bind(record.record_id)
             .execute(db)
             .await?;
     }
@@ -277,7 +277,7 @@ async fn process_filter(
     for record in &result.pro_records {
         sqlx::query("UPDATE BestProRecords SET points = ? WHERE record_id = ?")
             .bind(record.points)
-            .bind(record.record_id.as_slice())
+            .bind(record.record_id)
             .execute(db)
             .await?;
     }
@@ -293,7 +293,7 @@ async fn process_filter(
                 b = VALUES(b),
                 loc = VALUES(loc),
                 scale = VALUES(scale),
-                top_scale = VALUES(top_scale)"
+                top_scale = VALUES(top_scale)",
         )
         .bind(filter_id)
         .bind(result.nub_params.a)
@@ -316,7 +316,7 @@ async fn process_filter(
                 b = VALUES(b),
                 loc = VALUES(loc),
                 scale = VALUES(scale),
-                top_scale = VALUES(top_scale)"
+                top_scale = VALUES(top_scale)",
         )
         .bind(filter_id)
         .bind(result.pro_params.a)
