@@ -25,15 +25,6 @@ struct BestRecordRow {
     time: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct BestRecordUpsertRow {
-    filter_id: CourseFilterId,
-    player_id: PlayerId,
-    record_id: RecordId,
-    points: f64,
-    time: f64,
-}
-
 #[derive(Debug, Clone)]
 pub struct PointsDaemonHandle {
     notifications: Arc<Notifications>,
@@ -283,21 +274,20 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
         "recalculation complete, writing to DB"
     );
 
-    let nub_upsert_rows = build_upsert_rows(nub_rows, &result.nub_records)?;
-    let pro_upsert_rows = build_upsert_rows(pro_rows, &result.pro_records)?;
-
     cx.database_transaction(async move |conn| -> Result<_, database::Error> {
         upsert_best_records(
             conn,
             "INSERT INTO BestNubRecords (filter_id, player_id, record_id, points, time)",
-            &nub_upsert_rows,
+            &nub_rows,
+            &result.nub_records,
         )
         .await?;
 
         upsert_best_records(
             conn,
             "INSERT INTO BestProRecords (filter_id, player_id, record_id, points, time)",
-            &pro_upsert_rows,
+            &pro_rows,
+            &result.pro_records,
         )
         .await?;
 
@@ -354,49 +344,37 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
     Ok(())
 }
 
-fn build_upsert_rows(
-    rows: Vec<BestRecordRow>,
+async fn upsert_best_records(
+    conn: &mut database::Connection,
+    insert_prefix: &'static str,
+    rows: &[BestRecordRow],
     recalculated_records: &[calculator::RecordPoints],
-) -> Result<Vec<BestRecordUpsertRow>, database::Error> {
-    if rows.len() != recalculated_records.len() { // should never happen ?
+) -> Result<(), database::Error> {
+    if rows.len() != recalculated_records.len() {
         return Err(database::Error::decode(std::io::Error::other(
             "recalculated record count does not match fetched best record rows",
         )));
     }
 
-    rows.into_iter() // deterministic order because both queries have ORDER BY time ASC
-        .zip(recalculated_records)
-        .map(|(row, recalculated_record)| {
-            if row.record_id != recalculated_record.record_id { // should never happen ?
+    for (row_chunk, recalculated_chunk) in rows
+        .chunks(UPSERT_CHUNK_SIZE)
+        .zip(recalculated_records.chunks(UPSERT_CHUNK_SIZE))
+    {
+        for (row, recalculated_record) in row_chunk.iter().zip(recalculated_chunk.iter()) {
+            if row.record_id != recalculated_record.record_id {
                 return Err(database::Error::decode(std::io::Error::other(
                     "recalculated record order no longer matches fetched best record rows",
                 )));
             }
+        }
 
-            Ok(BestRecordUpsertRow {
-                filter_id: row.filter_id,
-                player_id: row.player_id,
-                record_id: row.record_id,
-                points: recalculated_record.points,
-                time: row.time,
-            })
-        })
-        .collect()
-}
-
-async fn upsert_best_records(
-    conn: &mut database::Connection,
-    insert_prefix: &'static str,
-    rows: &[BestRecordUpsertRow],
-) -> Result<(), database::Error> {
-    for chunk in rows.chunks(UPSERT_CHUNK_SIZE) {
         let mut query = database::QueryBuilder::new(insert_prefix);
 
-        query.push_values(chunk, |mut query, row| {
+        query.push_values(row_chunk.iter().zip(recalculated_chunk.iter()), |mut query, (row, recalculated_record)| {
             query.push_bind(row.filter_id);
             query.push_bind(row.player_id);
             query.push_bind(row.record_id);
-            query.push_bind(row.points);
+            query.push_bind(recalculated_record.points);
             query.push_bind(row.time);
         });
 
