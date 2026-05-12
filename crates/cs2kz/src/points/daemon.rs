@@ -3,7 +3,6 @@ use std::thread;
 use std::time::Duration;
 
 use futures_util::TryFutureExt as _;
-use sqlx::Row as _;
 use tokio::sync::Notify;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
@@ -11,8 +10,29 @@ use tokio_util::sync::CancellationToken;
 use crate::maps::CourseFilterId;
 use crate::maps::courses::Tier;
 use crate::mode::Mode;
+use crate::players::PlayerId;
 use crate::points::{NigParams, calculator};
+use crate::records::RecordId;
 use crate::{Context, database, players};
+
+const UPSERT_CHUNK_SIZE: usize = 5_000; // should prob put this somewhe
+
+#[derive(Debug, Clone, Copy)]
+struct BestRecordRow {
+    filter_id: CourseFilterId,
+    player_id: PlayerId,
+    record_id: RecordId,
+    time: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BestRecordUpsertRow {
+    filter_id: CourseFilterId,
+    player_id: PlayerId,
+    record_id: RecordId,
+    points: f64,
+    time: f64,
+}
 
 #[derive(Debug, Clone)]
 pub struct PointsDaemonHandle {
@@ -142,51 +162,62 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
 
     let db = cx.database().as_ref();
 
-    // Nub records (sorted by time ASC)
-    let nub_rows = sqlx::query(
-        "SELECT record_id, time
+    let nub_rows = sqlx::query_as!(
+        BestRecordRow,
+        "SELECT
+           filter_id AS `filter_id: CourseFilterId`,
+           player_id AS `player_id: PlayerId`,
+           record_id AS `record_id: RecordId`,
+           time
          FROM BestNubRecords
          WHERE filter_id = ?
          ORDER BY time ASC",
+        filter_id,
     )
-    .bind(filter_id)
     .fetch_all(db)
     .await?;
 
-    let nub_recs: Vec<calculator::BestRecordData> = nub_rows
+    let nub_recs = nub_rows
         .iter()
-        .map(|row| {
-            Ok(calculator::BestRecordData {
-                record_id: row.try_get(0)?,
-                time: row.try_get(1)?,
-            })
+        .map(|row| calculator::BestRecordData {
+            record_id: row.record_id,
+            time: row.time,
         })
-        .collect::<Result<_, database::Error>>()?;
+        .collect::<Vec<_>>();
 
     // Pro records (sorted by time ASC)
-    let pro_rows = sqlx::query(
-        "SELECT record_id, time
+    let pro_rows = sqlx::query_as!(
+        BestRecordRow,
+        "SELECT
+           filter_id AS `filter_id: CourseFilterId`,
+           player_id AS `player_id: PlayerId`,
+           record_id AS `record_id: RecordId`,
+           time
          FROM BestProRecords
          WHERE filter_id = ?
          ORDER BY time ASC",
+        filter_id,
     )
-    .bind(filter_id)
     .fetch_all(db)
     .await?;
 
-    let pro_recs: Vec<calculator::BestRecordData> = pro_rows
+    let pro_recs = pro_rows
         .iter()
-        .map(|row| {
-            Ok(calculator::BestRecordData {
-                record_id: row.try_get(0)?,
-                time: row.try_get(1)?,
-            })
+        .map(|row| calculator::BestRecordData {
+            record_id: row.record_id,
+            time: row.time,
         })
-        .collect::<Result<_, database::Error>>()?;
+        .collect::<Vec<_>>();
 
     // Filter tiers
-    let tiers_row = sqlx::query("SELECT nub_tier, pro_tier FROM CourseFilters WHERE id = ?")
-        .bind(filter_id)
+    let tiers_row = sqlx::query!(
+        "SELECT
+           nub_tier AS `nub_tier: Tier`,
+           pro_tier AS `pro_tier: Tier`
+         FROM CourseFilters
+         WHERE id = ?",
+        filter_id,
+    )
         .fetch_optional(db)
         .await?;
 
@@ -195,43 +226,29 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
         return Ok(());
     };
 
-    let nub_tier: Tier = tiers_row.try_get(0)?;
-    let pro_tier: Tier = tiers_row.try_get(1)?;
+    let nub_tier = tiers_row.nub_tier;
+    let pro_tier = tiers_row.pro_tier;
 
     // Previous distribution parameters for warm start
-    let prev_nub_row = sqlx::query(
+    let prev_nub_params = sqlx::query_as!(
+        NigParams,
         "SELECT a, b, loc, scale, top_scale
          FROM PointDistributionData
          WHERE filter_id = ? AND (NOT is_pro_leaderboard)",
+        filter_id,
     )
-    .bind(filter_id)
     .fetch_optional(db)
     .await?;
 
-    let prev_nub_params = prev_nub_row.map(|row| NigParams {
-        a: row.get(0),
-        b: row.get(1),
-        loc: row.get(2),
-        scale: row.get(3),
-        top_scale: row.get(4),
-    });
-
-    let prev_pro_row = sqlx::query(
+    let prev_pro_params = sqlx::query_as!(
+        NigParams,
         "SELECT a, b, loc, scale, top_scale
          FROM PointDistributionData
          WHERE filter_id = ? AND is_pro_leaderboard",
+        filter_id,
     )
-    .bind(filter_id)
     .fetch_optional(db)
     .await?;
-
-    let prev_pro_params = prev_pro_row.map(|row| NigParams {
-        a: row.get(0),
-        b: row.get(1),
-        loc: row.get(2),
-        scale: row.get(3),
-        top_scale: row.get(4),
-    });
 
     // heavy calcs on dedicated thread
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -266,66 +283,125 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
         "recalculation complete, writing to DB"
     );
 
-    for record in &result.nub_records {
-        sqlx::query("UPDATE BestNubRecords SET points = ? WHERE record_id = ?")
-            .bind(record.points)
-            .bind(record.record_id)
-            .execute(db)
-            .await?;
-    }
+    let nub_upsert_rows = build_upsert_rows(nub_rows, &result.nub_records)?;
+    let pro_upsert_rows = build_upsert_rows(pro_rows, &result.pro_records)?;
 
-    for record in &result.pro_records {
-        sqlx::query("UPDATE BestProRecords SET points = ? WHERE record_id = ?")
-            .bind(record.points)
-            .bind(record.record_id)
-            .execute(db)
-            .await?;
-    }
-
-    if result.nub_fitted {
-        sqlx::query(
-            "INSERT INTO PointDistributionData (
-                filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
-             )
-             VALUES (?, FALSE, ?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE
-                a = VALUES(a),
-                b = VALUES(b),
-                loc = VALUES(loc),
-                scale = VALUES(scale),
-                top_scale = VALUES(top_scale)",
+    cx.database_transaction(async move |conn| -> Result<_, database::Error> {
+        upsert_best_records(
+            conn,
+            "INSERT INTO BestNubRecords (filter_id, player_id, record_id, points, time)",
+            &nub_upsert_rows,
         )
-        .bind(filter_id)
-        .bind(result.nub_params.a)
-        .bind(result.nub_params.b)
-        .bind(result.nub_params.loc)
-        .bind(result.nub_params.scale)
-        .bind(result.nub_params.top_scale)
-        .execute(db)
         .await?;
+
+        upsert_best_records(
+            conn,
+            "INSERT INTO BestProRecords (filter_id, player_id, record_id, points, time)",
+            &pro_upsert_rows,
+        )
+        .await?;
+
+        if result.nub_fitted {
+            sqlx::query!(
+                "INSERT INTO PointDistributionData (
+                    filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
+                 )
+                 VALUES (?, FALSE, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE
+                    a = VALUES(a),
+                    b = VALUES(b),
+                    loc = VALUES(loc),
+                    scale = VALUES(scale),
+                    top_scale = VALUES(top_scale)",
+                filter_id,
+                result.nub_params.a,
+                result.nub_params.b,
+                result.nub_params.loc,
+                result.nub_params.scale,
+                result.nub_params.top_scale,
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        if result.pro_fitted {
+            sqlx::query!(
+                "INSERT INTO PointDistributionData (
+                    filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
+                 )
+                 VALUES (?, TRUE, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE
+                    a = VALUES(a),
+                    b = VALUES(b),
+                    loc = VALUES(loc),
+                    scale = VALUES(scale),
+                    top_scale = VALUES(top_scale)",
+                filter_id,
+                result.pro_params.a,
+                result.pro_params.b,
+                result.pro_params.loc,
+                result.pro_params.scale,
+                result.pro_params.top_scale,
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        Ok(())
+    })
+    .await?;
+
+    Ok(())
+}
+
+fn build_upsert_rows(
+    rows: Vec<BestRecordRow>,
+    recalculated_records: &[calculator::RecordPoints],
+) -> Result<Vec<BestRecordUpsertRow>, database::Error> {
+    if rows.len() != recalculated_records.len() { // should never happen ?
+        return Err(database::Error::decode(std::io::Error::other(
+            "recalculated record count does not match fetched best record rows",
+        )));
     }
 
-    if result.pro_fitted {
-        sqlx::query(
-            "INSERT INTO PointDistributionData (
-                filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
-             )
-             VALUES (?, TRUE, ?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE
-                a = VALUES(a),
-                b = VALUES(b),
-                loc = VALUES(loc),
-                scale = VALUES(scale),
-                top_scale = VALUES(top_scale)",
-        )
-        .bind(filter_id)
-        .bind(result.pro_params.a)
-        .bind(result.pro_params.b)
-        .bind(result.pro_params.loc)
-        .bind(result.pro_params.scale)
-        .bind(result.pro_params.top_scale)
-        .execute(db)
-        .await?;
+    rows.into_iter() // deterministic order because both queries have ORDER BY time ASC
+        .zip(recalculated_records)
+        .map(|(row, recalculated_record)| {
+            if row.record_id != recalculated_record.record_id { // should never happen ?
+                return Err(database::Error::decode(std::io::Error::other(
+                    "recalculated record order no longer matches fetched best record rows",
+                )));
+            }
+
+            Ok(BestRecordUpsertRow {
+                filter_id: row.filter_id,
+                player_id: row.player_id,
+                record_id: row.record_id,
+                points: recalculated_record.points,
+                time: row.time,
+            })
+        })
+        .collect()
+}
+
+async fn upsert_best_records(
+    conn: &mut database::Connection,
+    insert_prefix: &'static str,
+    rows: &[BestRecordUpsertRow],
+) -> Result<(), database::Error> {
+    for chunk in rows.chunks(UPSERT_CHUNK_SIZE) {
+        let mut query = database::QueryBuilder::new(insert_prefix);
+
+        query.push_values(chunk, |mut query, row| {
+            query.push_bind(row.filter_id);
+            query.push_bind(row.player_id);
+            query.push_bind(row.record_id);
+            query.push_bind(row.points);
+            query.push_bind(row.time);
+        });
+
+        query.push(" ON DUPLICATE KEY UPDATE points = VALUES(points)");
+        query.build().execute(&mut *conn).await?;
     }
 
     Ok(())
