@@ -1,8 +1,6 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryFutureExt as _;
-use tokio::sync::Notify;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
@@ -22,29 +20,6 @@ struct BestRecordRow {
     player_id: PlayerId,
     record_id: RecordId,
     time: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PointsDaemonHandle {
-    notifications: Arc<Notifications>,
-}
-
-impl PointsDaemonHandle {
-    #[expect(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self {
-            notifications: Arc::new(Notifications { record_submitted: Notify::new() }),
-        }
-    }
-
-    pub fn notify_record_submitted(&self) {
-        self.notifications.record_submitted.notify_waiters();
-    }
-}
-
-#[derive(Debug)]
-struct Notifications {
-    record_submitted: Notify,
 }
 
 #[derive(Debug, Display, Error, From)]
@@ -115,12 +90,7 @@ async fn determine_filter_to_recalculate(
             break Ok(data);
         }
 
-        () = cx
-            .points_daemon()
-            .notifications
-            .record_submitted
-            .notified()
-            .await;
+        cx.wait_for_points_recalculation().await;
 
         tracing::trace!("received notification about submitted record");
     }

@@ -1,9 +1,6 @@
 mod database;
 pub use database::DatabaseConfig;
 
-mod points;
-pub use points::PointsConfig;
-
 mod replays;
 pub use replays::ReplayStorageConfig;
 

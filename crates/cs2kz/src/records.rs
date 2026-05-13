@@ -500,7 +500,7 @@ pub async fn submit(
         }
     }
 
-    cx.points_daemon().notify_record_submitted();
+    cx.notify_points_recalculation();
 
     events::dispatch(Event::NewRecord {
         player_id,
