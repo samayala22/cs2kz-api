@@ -14,7 +14,7 @@ use crate::num::AsF64;
 use crate::pagination::{Limit, Offset, Paginated};
 use crate::players::{CalculateRatingError, PlayerId, PlayerInfo};
 use crate::plugin::PluginVersionId;
-use crate::points::{self, NigParams, calculator};
+use crate::points::{self, NigParams};
 use crate::servers::{ServerId, ServerInfo};
 use crate::styles::{ClientStyleInfo, Styles};
 use crate::time::Seconds;
@@ -325,7 +325,7 @@ pub async fn submit(
                 (None, Some(_)) => unreachable!(),
             };
 
-            let nub_data = points::calculator::LeaderboardData {
+            let nub_data = points::LeaderboardData {
                 dist_params: nub_dist,
                 tier: nub_tier,
                 leaderboard_size: nub_leaderboard_size,
@@ -369,7 +369,7 @@ pub async fn submit(
                     row.map_or((0, None), |row| (row.size as u64, row.top_time))
                 })?;
 
-                Some(points::calculator::LeaderboardData {
+                Some(points::LeaderboardData {
                     dist_params: pro_dist,
                     tier: pro_tier,
                     leaderboard_size: pro_leaderboard_size + u64::from(pro_pb_time.is_none()),
@@ -379,10 +379,10 @@ pub async fn submit(
                 None
             };
 
-            let nub_fraction = calculator::calculate_fraction(time.as_f64(), &nub_data);
+            let nub_fraction = points::calculate_fraction(time.as_f64(), &nub_data);
             let pro_fraction = pro_data
                 .as_ref()
-                .map(|leaderboard| calculator::calculate_fraction(time.as_f64(), leaderboard))
+                .map(|leaderboard| points::calculate_fraction(time.as_f64(), leaderboard))
                 .map(|fraction| fraction.max(nub_fraction));
             let points = CalculatedPoints { nub_fraction, pro_fraction };
 

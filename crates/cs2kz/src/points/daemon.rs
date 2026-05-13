@@ -11,7 +11,7 @@ use crate::maps::CourseFilterId;
 use crate::maps::courses::Tier;
 use crate::mode::Mode;
 use crate::players::PlayerId;
-use crate::points::{NigParams, calculator};
+use crate::points::{self, NigParams};
 use crate::records::RecordId;
 use crate::{Context, database, players};
 
@@ -170,7 +170,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
 
     let nub_recs = nub_rows
         .iter()
-        .map(|row| calculator::RecordTime { record_id: row.record_id, time: row.time })
+        .map(|row| points::RecordTime { record_id: row.record_id, time: row.time })
         .collect::<Vec<_>>();
 
     // Pro records (sorted by time ASC)
@@ -191,7 +191,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
 
     let pro_recs = pro_rows
         .iter()
-        .map(|row| calculator::RecordTime { record_id: row.record_id, time: row.time })
+        .map(|row| points::RecordTime { record_id: row.record_id, time: row.time })
         .collect::<Vec<_>>();
 
     // Filter tiers
@@ -245,13 +245,15 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
         let prev_pro_params = prev_pro_params;
 
         move || {
-            let nub_result = calculator::recalculate_leaderboard(&nub_recs, nub_tier, prev_nub_params.as_ref());
+            let nub_result =
+                points::recalculate_leaderboard(&nub_recs, nub_tier, prev_nub_params.as_ref());
 
-            let mut pro_result = calculator::recalculate_leaderboard(&pro_recs, pro_tier, prev_pro_params.as_ref());
+            let mut pro_result =
+                points::recalculate_leaderboard(&pro_recs, pro_tier, prev_pro_params.as_ref());
 
             for (record, recalculated_record) in pro_recs.iter().zip(pro_result.records.iter_mut())
             {
-                let nub_fraction = calculator::calculate_fraction(record.time, &nub_result.leaderboard);
+                let nub_fraction = points::calculate_fraction(record.time, &nub_result.leaderboard);
                 recalculated_record.points = recalculated_record.points.max(nub_fraction);
             }
 
@@ -344,7 +346,7 @@ async fn upsert_best_records(
     conn: &mut database::Connection,
     insert_prefix: &'static str,
     rows: &[BestRecordRow],
-    recalculated_records: &[calculator::RecordPoints],
+    recalculated_records: &[points::RecordPoints],
 ) -> Result<(), database::Error> {
     if rows.len() != recalculated_records.len() {
         return Err(database::Error::decode(std::io::Error::other(
