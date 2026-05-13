@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use futures_util::TryFutureExt as _;
@@ -235,34 +234,23 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
     .fetch_optional(db)
     .await?;
 
-    // heavy calcs on dedicated thread
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (nub_result, pro_result) = tokio::task::spawn_blocking(move || {
+        let nub_result =
+            points::recalculate_leaderboard(&nub_recs, nub_tier, prev_nub_params.as_ref());
 
-    thread::spawn({
-        let nub_recs = nub_recs.clone();
-        let pro_recs = pro_recs.clone();
-        let prev_nub_params = prev_nub_params;
-        let prev_pro_params = prev_pro_params;
+        let mut pro_result =
+            points::recalculate_leaderboard(&pro_recs, pro_tier, prev_pro_params.as_ref());
 
-        move || {
-            let nub_result =
-                points::recalculate_leaderboard(&nub_recs, nub_tier, prev_nub_params.as_ref());
-
-            let mut pro_result =
-                points::recalculate_leaderboard(&pro_recs, pro_tier, prev_pro_params.as_ref());
-
-            for (record, recalculated_record) in pro_recs.iter().zip(pro_result.records.iter_mut())
-            {
-                let nub_fraction = points::calculate_fraction(record.time, &nub_result.leaderboard);
-                recalculated_record.points = recalculated_record.points.max(nub_fraction);
-            }
-
-            let _ = tx.send((nub_result, pro_result));
+        for (record, recalculated_record) in pro_recs.iter().zip(pro_result.records.iter_mut()) {
+            let nub_fraction = points::calculate_fraction(record.time, &nub_result.leaderboard);
+            recalculated_record.points = recalculated_record.points.max(nub_fraction);
         }
-    });
 
-    let (nub_result, pro_result) = rx.await.map_err(|_| {
-        database::Error::decode(std::io::Error::other("points recalculation thread panicked"))
+        (nub_result, pro_result)
+    })
+    .await
+    .map_err(|_| {
+        database::Error::decode(std::io::Error::other("points recalculation task panicked"))
     })?;
 
     tracing::debug!(
