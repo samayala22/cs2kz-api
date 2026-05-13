@@ -267,8 +267,8 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
 
     tracing::debug!(
         %filter_id,
-        nub_fitted = nub_result.fitted,
-        pro_fitted = pro_result.fitted,
+        nub_fitted = nub_result.params.is_some(),
+        pro_fitted = pro_result.params.is_some(),
         "recalculation complete, writing to DB"
     );
 
@@ -289,7 +289,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
         )
         .await?;
 
-        if nub_result.fitted {
+        if let Some(params) = nub_result.params {
             sqlx::query!(
                 "INSERT INTO PointDistributionData (
                     filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
@@ -302,17 +302,17 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
                     scale = VALUES(scale),
                     top_scale = VALUES(top_scale)",
                 filter_id,
-                nub_result.params.a,
-                nub_result.params.b,
-                nub_result.params.loc,
-                nub_result.params.scale,
-                nub_result.params.top_scale,
+                params.a,
+                params.b,
+                params.loc,
+                params.scale,
+                params.top_scale,
             )
             .execute(&mut *conn)
             .await?;
         }
 
-        if pro_result.fitted {
+        if let Some(params) = pro_result.params {
             sqlx::query!(
                 "INSERT INTO PointDistributionData (
                     filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
@@ -325,11 +325,11 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
                     scale = VALUES(scale),
                     top_scale = VALUES(top_scale)",
                 filter_id,
-                pro_result.params.a,
-                pro_result.params.b,
-                pro_result.params.loc,
-                pro_result.params.scale,
-                pro_result.params.top_scale,
+                params.a,
+                params.b,
+                params.loc,
+                params.scale,
+                params.top_scale,
             )
             .execute(&mut *conn)
             .await?;

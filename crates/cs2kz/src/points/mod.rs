@@ -34,8 +34,7 @@ pub struct RecordPoints {
 pub struct RecalculatedLeaderboard {
     pub leaderboard: LeaderboardData,
     pub records: Vec<RecordPoints>,
-    pub params: NigParams,
-    pub fitted: bool,
+    pub params: Option<NigParams>,
 }
 
 /// The maximum points for any record.
@@ -130,10 +129,10 @@ pub fn recalculate_leaderboard(
     prev_params: Option<&NigParams>,
 ) -> RecalculatedLeaderboard {
     let times: Vec<f64> = records.iter().map(|record| record.time).collect();
-    let (params, fitted) = fit_distribution(&times, prev_params);
+    let params = fit_distribution(&times, prev_params);
 
     let leaderboard = LeaderboardData {
-        dist_params: fitted.then_some(params),
+        dist_params: params,
         tier,
         leaderboard_size: records.len() as u64,
         top_time: times.first().copied().unwrap_or(0.0),
@@ -151,29 +150,16 @@ pub fn recalculate_leaderboard(
         leaderboard,
         records: recalculated_records,
         params,
-        fitted,
     }
 }
 
-fn fit_distribution(times: &[f64], prev_params: Option<&NigParams>) -> (NigParams, bool) {
-    let zero_params = NigParams {
-        a: 0.0,
-        b: 0.0,
-        loc: 0.0,
-        scale: 0.0,
-        top_scale: 0.0,
-    };
-
+fn fit_distribution(times: &[f64], prev_params: Option<&NigParams>) -> Option<NigParams> {
     if times.len() < SMALL_LEADERBOARD_THRESHOLD as usize {
-        return (zero_params, false);
+        return None;
     }
 
     let result = nig::fit_nig(times, prev_params);
-    if result.valid {
-        (result.params, true)
-    } else {
-        (zero_params, false)
-    }
+    if result.valid { Some(result.params) } else { None }
 }
 
 #[cfg(test)]
