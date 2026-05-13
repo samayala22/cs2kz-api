@@ -1,6 +1,6 @@
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-use std::fmt;
 
 use tokio::task;
 use tokio_util::sync::CancellationToken;

@@ -170,10 +170,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
 
     let nub_recs = nub_rows
         .iter()
-        .map(|row| calculator::BestRecordData {
-            record_id: row.record_id,
-            time: row.time,
-        })
+        .map(|row| calculator::RecordTime { record_id: row.record_id, time: row.time })
         .collect::<Vec<_>>();
 
     // Pro records (sorted by time ASC)
@@ -194,10 +191,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
 
     let pro_recs = pro_rows
         .iter()
-        .map(|row| calculator::BestRecordData {
-            record_id: row.record_id,
-            time: row.time,
-        })
+        .map(|row| calculator::RecordTime { record_id: row.record_id, time: row.time })
         .collect::<Vec<_>>();
 
     // Filter tiers
@@ -209,8 +203,8 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
          WHERE id = ?",
         filter_id,
     )
-        .fetch_optional(db)
-        .await?;
+    .fetch_optional(db)
+    .await?;
 
     let Some(tiers_row) = tiers_row else {
         tracing::warn!(%filter_id, "filter not found in CourseFilters");
@@ -251,26 +245,28 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
         let prev_pro_params = prev_pro_params;
 
         move || {
-            let result = calculator::recalculate_filter(
-                &nub_recs,
-                &pro_recs,
-                nub_tier,
-                pro_tier,
-                prev_nub_params.as_ref(),
-                prev_pro_params.as_ref(),
-            );
-            let _ = tx.send(result);
+            let nub_result = calculator::recalculate_leaderboard(&nub_recs, nub_tier, prev_nub_params.as_ref());
+
+            let mut pro_result = calculator::recalculate_leaderboard(&pro_recs, pro_tier, prev_pro_params.as_ref());
+
+            for (record, recalculated_record) in pro_recs.iter().zip(pro_result.records.iter_mut())
+            {
+                let nub_fraction = calculator::calculate_fraction(record.time, &nub_result.leaderboard);
+                recalculated_record.points = recalculated_record.points.max(nub_fraction);
+            }
+
+            let _ = tx.send((nub_result, pro_result));
         }
     });
 
-    let result = rx.await.map_err(|_| {
+    let (nub_result, pro_result) = rx.await.map_err(|_| {
         database::Error::decode(std::io::Error::other("points recalculation thread panicked"))
     })?;
 
     tracing::debug!(
         %filter_id,
-        nub_fitted = result.nub_fitted,
-        pro_fitted = result.pro_fitted,
+        nub_fitted = nub_result.fitted,
+        pro_fitted = pro_result.fitted,
         "recalculation complete, writing to DB"
     );
 
@@ -279,7 +275,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
             conn,
             "INSERT INTO BestNubRecords (filter_id, player_id, record_id, points, time)",
             &nub_rows,
-            &result.nub_records,
+            &nub_result.records,
         )
         .await?;
 
@@ -287,11 +283,11 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
             conn,
             "INSERT INTO BestProRecords (filter_id, player_id, record_id, points, time)",
             &pro_rows,
-            &result.pro_records,
+            &pro_result.records,
         )
         .await?;
 
-        if result.nub_fitted {
+        if nub_result.fitted {
             sqlx::query!(
                 "INSERT INTO PointDistributionData (
                     filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
@@ -304,17 +300,17 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
                     scale = VALUES(scale),
                     top_scale = VALUES(top_scale)",
                 filter_id,
-                result.nub_params.a,
-                result.nub_params.b,
-                result.nub_params.loc,
-                result.nub_params.scale,
-                result.nub_params.top_scale,
+                nub_result.params.a,
+                nub_result.params.b,
+                nub_result.params.loc,
+                nub_result.params.scale,
+                nub_result.params.top_scale,
             )
             .execute(&mut *conn)
             .await?;
         }
 
-        if result.pro_fitted {
+        if pro_result.fitted {
             sqlx::query!(
                 "INSERT INTO PointDistributionData (
                     filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
@@ -327,11 +323,11 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
                     scale = VALUES(scale),
                     top_scale = VALUES(top_scale)",
                 filter_id,
-                result.pro_params.a,
-                result.pro_params.b,
-                result.pro_params.loc,
-                result.pro_params.scale,
-                result.pro_params.top_scale,
+                pro_result.params.a,
+                pro_result.params.b,
+                pro_result.params.loc,
+                pro_result.params.scale,
+                pro_result.params.top_scale,
             )
             .execute(&mut *conn)
             .await?;
@@ -370,13 +366,16 @@ async fn upsert_best_records(
 
         let mut query = database::QueryBuilder::new(insert_prefix);
 
-        query.push_values(row_chunk.iter().zip(recalculated_chunk.iter()), |mut query, (row, recalculated_record)| {
-            query.push_bind(row.filter_id);
-            query.push_bind(row.player_id);
-            query.push_bind(row.record_id);
-            query.push_bind(recalculated_record.points);
-            query.push_bind(row.time);
-        });
+        query.push_values(
+            row_chunk.iter().zip(recalculated_chunk.iter()),
+            |mut query, (row, recalculated_record)| {
+                query.push_bind(row.filter_id);
+                query.push_bind(row.player_id);
+                query.push_bind(row.record_id);
+                query.push_bind(recalculated_record.points);
+                query.push_bind(row.time);
+            },
+        );
 
         query.push(" ON DUPLICATE KEY UPDATE points = VALUES(points)");
         query.build().execute(&mut *conn).await?;

@@ -1,6 +1,5 @@
 use crate::bessel::bessel_k1_scaled;
 
-
 pub(crate) fn nig_pdf(a: f64, b: f64, mu: f64, delta: f64, x: f64) -> f64 {
     if a <= 0.0 || delta <= 0.0 || b.abs() >= a {
         return 0.0;
@@ -17,10 +16,7 @@ pub(crate) fn nig_pdf(a: f64, b: f64, mu: f64, delta: f64, x: f64) -> f64 {
     }
 
     let net_exp = gamma + b * z - y;
-    let log_pdf = a.ln()
-        - std::f64::consts::PI.ln()
-        - delta.ln()
-        - sqrt_z2p1.ln()
+    let log_pdf = a.ln() - std::f64::consts::PI.ln() - delta.ln() - sqrt_z2p1.ln()
         + net_exp
         + scaled_bessel.ln();
 
@@ -85,7 +81,7 @@ fn adaptive_simpson_rec(
 
     Some(
         adaptive_simpson_rec(&mut *f, a, m, eps / 2.0, left, fa, fm, flm, depth - 1)?
-        + adaptive_simpson_rec(&mut *f, m, b, eps / 2.0, right, fm, fb, frm, depth - 1)?,
+            + adaptive_simpson_rec(&mut *f, m, b, eps / 2.0, right, fm, fb, frm, depth - 1)?,
     )
 }
 

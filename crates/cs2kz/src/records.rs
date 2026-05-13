@@ -14,11 +14,16 @@ use crate::num::AsF64;
 use crate::pagination::{Limit, Offset, Paginated};
 use crate::players::{CalculateRatingError, PlayerId, PlayerInfo};
 use crate::plugin::PluginVersionId;
-use crate::points::calculator::{self, Request as CalculatePointsRequest, Response as CalculatePointsResponse};
-use crate::points::{self, NigParams};
+use crate::points::{self, NigParams, calculator};
 use crate::servers::{ServerId, ServerInfo};
 use crate::styles::{ClientStyleInfo, Styles};
 use crate::time::Seconds;
+
+#[derive(Debug, Clone, Copy)]
+struct CalculatedPoints {
+    nub_fraction: f64,
+    pro_fraction: Option<f64>,
+}
 
 define_id_type! {
     /// A unique identifier for records.
@@ -374,36 +379,12 @@ pub async fn submit(
                 None
             };
 
-            let points = if nub_leaderboard_size > points::SMALL_LEADERBOARD_THRESHOLD
-                && nub_data.dist_params.is_some()
-            {
-                let request = CalculatePointsRequest {
-                    time: time.as_f64(),
-                    nub_data,
-                    pro_data: pro_data.clone().filter(|data| data.dist_params.is_some()),
-                };
-
-                let mut response = calculator::calculate(&request);
-
-                if let Some(ref pro_data) = pro_data && request.pro_data.is_none() {
-                    response.pro_fraction = Some(points::for_small_leaderboard(
-                        pro_data.tier,
-                        pro_data.top_time,
-                        time.as_f64(),
-                    ));
-                }
-
-                response
-            } else {
-                let nub_fraction =
-                    points::for_small_leaderboard(nub_data.tier, nub_data.top_time, time.as_f64());
-
-                let pro_fraction = pro_data.clone().map(|pro_data| {
-                    points::for_small_leaderboard(pro_data.tier, pro_data.top_time, time.as_f64())
-                });
-
-                CalculatePointsResponse { nub_fraction, pro_fraction }
-            };
+            let nub_fraction = calculator::calculate_fraction(time.as_f64(), &nub_data);
+            let pro_fraction = pro_data
+                .as_ref()
+                .map(|leaderboard| calculator::calculate_fraction(time.as_f64(), leaderboard))
+                .map(|fraction| fraction.max(nub_fraction));
+            let points = CalculatedPoints { nub_fraction, pro_fraction };
 
             let is_nub_pb = nub_pb_time.is_none_or(|nub_pb_time| nub_pb_time > time.as_f64());
 

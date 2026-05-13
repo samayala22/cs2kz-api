@@ -33,7 +33,10 @@ pub fn fit_nig(times: &[f64], prev_params: Option<&NigParams>) -> FitResult {
         if sf <= 0.0 { 1.0 } else { sf }
     };
 
-    FitResult { params: NigParams { a, b, loc, scale, top_scale }, valid: true }
+    FitResult {
+        params: NigParams { a, b, loc, scale, top_scale },
+        valid: true,
+    }
 }
 
 /// Median-based location estimate.
@@ -115,19 +118,20 @@ pub(crate) fn neg_log_likelihood(times: &[f64], a: f64, b: f64, loc: f64, scale:
             return f64::INFINITY;
         }
 
-        let log_pdf = a.ln()
-            - std::f64::consts::PI.ln()
-            - delta.ln()
-            + gamma
-            + b * z
-            + bessel.ln()
+        let log_pdf = a.ln() - std::f64::consts::PI.ln() - delta.ln() + gamma + b * z + bessel.ln()
             - sqrt_z2p1.ln();
         nll -= log_pdf;
     }
     nll
 }
 
-pub(crate) fn optimize_nig(times: &[f64], mut a: f64, mut b: f64, mut loc: f64, mut scale: f64) -> (f64, f64, f64, f64) {
+pub(crate) fn optimize_nig(
+    times: &[f64],
+    mut a: f64,
+    mut b: f64,
+    mut loc: f64,
+    mut scale: f64,
+) -> (f64, f64, f64, f64) {
     const MAX_ITER: usize = 200;
     const TOL: f64 = 1e-8;
     const INIT_LR: f64 = 0.01;

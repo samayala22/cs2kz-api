@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
                 url,
                 min_connections: 1,
                 max_connections: Some(NonZero::<u32>::MIN),
-            }
+            },
         })?;
 
     let cx = Context::new(cfg).await?;
