@@ -330,7 +330,7 @@ async fn upsert_best_records(
         );
 
         query.push(" ON DUPLICATE KEY UPDATE points = VALUES(points)");
-        query.build().execute(&mut *conn).await?;
+        query.build().persistent(false).execute(&mut *conn).await?;
     }
 
     Ok(())
