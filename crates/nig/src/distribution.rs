@@ -1,4 +1,4 @@
-use crate::bessel::bessel_k1_scaled;
+use crate::bessel::bessel_k1e;
 
 pub(crate) fn nig_pdf(a: f64, b: f64, mu: f64, delta: f64, x: f64) -> f64 {
     if a <= 0.0 || delta <= 0.0 || b.abs() >= a {
@@ -9,7 +9,7 @@ pub(crate) fn nig_pdf(a: f64, b: f64, mu: f64, delta: f64, x: f64) -> f64 {
     let z = (x - mu) / delta;
     let sqrt_z2p1 = (z * z + 1.0).sqrt();
     let y = a * sqrt_z2p1;
-    let scaled_bessel = bessel_k1_scaled(y);
+    let scaled_bessel = bessel_k1e(y);
 
     if scaled_bessel <= 0.0 {
         return 0.0;

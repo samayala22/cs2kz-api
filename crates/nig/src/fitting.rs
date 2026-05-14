@@ -1,8 +1,14 @@
-use crate::bessel::bessel_k1;
+use crate::bessel::bessel_k1e;
 use crate::distribution::nig_survival;
-use crate::params::{FitResult, NigParams};
+use crate::params::NigParams;
 
-pub(crate) fn central_diff(mut f: impl FnMut(f64) -> f64, x0: f64) -> f64 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptimizeNigError {
+    MaxIterationsReached,
+    StepSizeExhausted,
+}
+
+fn central_diff(mut f: impl FnMut(f64) -> f64, x0: f64) -> f64 {
     let eps = f64::EPSILON;
     let h = eps.cbrt() * x0.abs().max(1.0); // https://docs.sciml.ai/FiniteDiff/dev/epsilons/
     let x_plus = x0 + h;
@@ -11,7 +17,7 @@ pub(crate) fn central_diff(mut f: impl FnMut(f64) -> f64, x0: f64) -> f64 {
     (f(x_plus) - f(x_minus)) / denom
 }
 
-pub fn fit_nig(times: &[f64], prev_params: Option<&NigParams>) -> FitResult {
+pub fn fit_nig(times: &[f64], prev_params: Option<&NigParams>) -> Option<NigParams> {
     let (a, b, loc, scale);
 
     if let Some(prev) = prev_params.filter(|p| p.a > 0.0) {
@@ -26,21 +32,24 @@ pub fn fit_nig(times: &[f64], prev_params: Option<&NigParams>) -> FitResult {
         b = estimate_beta(times, loc, scale, a);
     }
 
-    let (a, b, loc, scale) = optimize_nig(times, a, b, loc, scale);
+    let (a, b, loc, scale) = match optimize_nig(times, a, b, loc, scale) {
+        Ok(params) => params,
+        Err(err) => {
+            tracing::warn!(?err, samples = times.len(), "NIG optimization failed; using initial estimates");
+            (a, b, loc, scale)
+        }
+    };
 
     let top_scale = {
         let sf = nig_survival(a, b, loc, scale, times[0]);
         if sf <= 0.0 { 1.0 } else { sf }
     };
 
-    FitResult {
-        params: NigParams { a, b, loc, scale, top_scale },
-        valid: true,
-    }
+    Some(NigParams { a, b, loc, scale, top_scale })
 }
 
 /// Median-based location estimate.
-pub(crate) fn estimate_location(times: &[f64]) -> f64 {
+fn estimate_location(times: &[f64]) -> f64 {
     let n = times.len();
     if n % 2 == 0 {
         (times[n / 2 - 1] + times[n / 2]) / 2.0
@@ -50,14 +59,14 @@ pub(crate) fn estimate_location(times: &[f64]) -> f64 {
 }
 
 /// Standard-deviation-based scale estimate.
-pub(crate) fn estimate_scale(times: &[f64], loc: f64) -> f64 {
+fn estimate_scale(times: &[f64], loc: f64) -> f64 {
     let n = times.len() as f64;
     let variance = times.iter().map(|&t| (t - loc).powi(2)).sum::<f64>() / n;
     variance.max(1e-10).sqrt()
 }
 
 /// Kurtosis-based estimate
-pub(crate) fn estimate_alpha(times: &[f64], loc: f64, _scale: f64) -> f64 {
+fn estimate_alpha(times: &[f64], loc: f64, _scale: f64) -> f64 {
     let n = times.len() as f64;
     let (mut m2, mut m4) = (0.0, 0.0);
     for &t in times {
@@ -77,7 +86,7 @@ pub(crate) fn estimate_alpha(times: &[f64], loc: f64, _scale: f64) -> f64 {
 }
 
 /// Skewness-based estimate
-pub(crate) fn estimate_beta(times: &[f64], loc: f64, _scale: f64, alpha: f64) -> f64 {
+fn estimate_beta(times: &[f64], loc: f64, _scale: f64, alpha: f64) -> f64 {
     let n = times.len() as f64;
     let (mut m2, mut m3) = (0.0, 0.0);
     for &t in times {
@@ -100,7 +109,7 @@ pub(crate) fn estimate_beta(times: &[f64], loc: f64, _scale: f64, alpha: f64) ->
     beta
 }
 
-pub(crate) fn neg_log_likelihood(times: &[f64], a: f64, b: f64, loc: f64, scale: f64) -> f64 {
+fn neg_log_likelihood(times: &[f64], a: f64, b: f64, loc: f64, scale: f64) -> f64 {
     if a <= 0.0 || scale <= 0.0 || b.abs() >= a {
         return f64::INFINITY;
     }
@@ -113,25 +122,29 @@ pub(crate) fn neg_log_likelihood(times: &[f64], a: f64, b: f64, loc: f64, scale:
     for &x in times {
         let z = (x - mu) / delta;
         let sqrt_z2p1 = (z * z + 1.0).sqrt();
-        let bessel = bessel_k1(a * sqrt_z2p1);
-        if bessel <= 0.0 {
+        let y = a * sqrt_z2p1;
+        let scaled_bessel = bessel_k1e(y);
+        if scaled_bessel <= 0.0 {
             return f64::INFINITY;
         }
 
-        let log_pdf = a.ln() - std::f64::consts::PI.ln() - delta.ln() + gamma + b * z + bessel.ln()
-            - sqrt_z2p1.ln();
+        let log_pdf = a.ln() - std::f64::consts::PI.ln() - delta.ln() - sqrt_z2p1.ln()
+            + gamma
+            + b * z
+            - y
+            + scaled_bessel.ln();
         nll -= log_pdf;
     }
     nll
 }
 
-pub(crate) fn optimize_nig(
+fn optimize_nig(
     times: &[f64],
     mut a: f64,
     mut b: f64,
     mut loc: f64,
     mut scale: f64,
-) -> (f64, f64, f64, f64) {
+) -> Result<(f64, f64, f64, f64), OptimizeNigError> {
     const MAX_ITER: usize = 200;
     const TOL: f64 = 1e-8;
     const INIT_LR: f64 = 0.01;
@@ -169,7 +182,7 @@ pub(crate) fn optimize_nig(
                 b = new_b;
                 loc = new_loc;
                 scale = new_scale;
-                break;
+                return Ok((a, b, loc, scale));
             }
             a = new_a;
             b = new_b;
@@ -186,12 +199,12 @@ pub(crate) fn optimize_nig(
         } else {
             lr *= 0.5;
             if lr < 1e-10 {
-                break;
+                return Err(OptimizeNigError::StepSizeExhausted);
             }
         }
     }
 
-    (a, b, loc, scale)
+    Err(OptimizeNigError::MaxIterationsReached)
 }
 
 #[cfg(test)]
@@ -221,6 +234,22 @@ mod tests {
         let nll = neg_log_likelihood(&times, 5.0, 2.0, 8.0, 1.0);
         assert!(nll.is_finite());
         assert!(nll > 0.0);
+    }
+
+    #[test]
+    fn neg_log_likelihood_matches_scipy_reference_value() {
+        let times: Vec<f64> = (0..200)
+            .map(|i| 7.0 + (i as f64).powf(1.5) * 0.005)
+            .collect();
+        let nll = neg_log_likelihood(
+            &times,
+            86.72396846356486,
+            86.68319372270773,
+            4.487105095426718,
+            0.24914444085073106,
+        );
+
+        assert_abs_close(nll, 559.6276051205211, 1e-6);
     }
 
     #[test]
@@ -265,13 +294,12 @@ mod tests {
         let times: Vec<f64> = (0..200)
             .map(|i| 7.0 + (i as f64).powf(1.5) * 0.005)
             .collect();
-        let result = fit_nig(&times, None);
-        assert!(result.valid);
-        assert!(result.params.a > 0.01);
-        assert!(result.params.b.abs() < result.params.a);
-        assert!(result.params.scale > 1e-6);
-        assert!(result.params.top_scale > 0.0);
-        assert!(result.params.top_scale <= 1.01);
+        let result = fit_nig(&times, None).expect("expected fit to converge"); 
+        assert!(result.a > 0.01);
+        assert!(result.b.abs() < result.a);
+        assert!(result.scale > 1e-6);
+        assert!(result.top_scale > 0.0);
+        assert!(result.top_scale <= 1.01);
     }
 
     #[test]
@@ -279,9 +307,29 @@ mod tests {
         let times: Vec<f64> = (0..200)
             .map(|i| 7.0 + (i as f64).powf(1.5) * 0.005)
             .collect();
-        let cold_result = fit_nig(&times, None);
-        let warm_result = fit_nig(&times, Some(&cold_result.params));
-        assert!(warm_result.valid);
-        assert_abs_close(warm_result.params.a, cold_result.params.a, 1.0);
+        let cold_result = fit_nig(&times, None).expect("expected cold fit to converge");
+        let warm_result = fit_nig(&times, Some(&cold_result)).expect("expected warm fit to converge");
+        assert_abs_close(warm_result.a, cold_result.a, 1.0);
+    }
+
+    #[test]
+    fn fit_nig_improves_initial_estimates_on_synthetic_data() {
+        let times: Vec<f64> = (0..200)
+            .map(|i| 7.0 + (i as f64).powf(1.5) * 0.005)
+            .collect();
+        let loc = estimate_location(&times);
+        let scale = estimate_scale(&times, loc);
+        let a = estimate_alpha(&times, loc, scale);
+        let b = estimate_beta(&times, loc, scale, a);
+        let initial_nll = neg_log_likelihood(&times, a, b, loc, scale);
+
+        let fitted = fit_nig(&times, None).expect("expected fit to converge");
+        let fitted_nll = neg_log_likelihood(&times, fitted.a, fitted.b, fitted.loc, fitted.scale);
+
+        assert!(fitted_nll.is_finite());
+        assert!(
+            fitted_nll <= initial_nll,
+            "expected fitted params to improve NLL; initial={initial_nll:.6}, fitted={fitted_nll:.6}",
+        );
     }
 }

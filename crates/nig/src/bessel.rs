@@ -68,49 +68,16 @@ fn bessel_k1_small(x: f64) -> f64 {
 }
 
 fn bessel_k1_large(x: f64) -> f64 {
-    const Y: f64 = 1.45034217834472656e+00;
-
-    const P: [f64; 9] = [
-        -1.97028041029226295e-01,
-        -2.32408961548087617e+00,
-        -7.98269784507699938e+00,
-        -2.39968410774221632e+00,
-        3.28314043780858713e+01,
-        5.67713761158496058e+01,
-        3.30907788466509823e+01,
-        6.62582288933739787e+00,
-        3.08851840645286691e-01,
-    ];
-    const Q: [f64; 9] = [
-        1.00000000000000000e+00,
-        1.41811409298826118e+01,
-        7.35979466317556420e+01,
-        1.77821793937080859e+02,
-        2.11014501598705982e+02,
-        1.19425262951064454e+02,
-        2.88448064302447607e+01,
-        2.27912927104139732e+00,
-        2.50358186953478678e-02,
-    ];
-
-    let rat = evaluate_rational(&P, &Q, 1.0 / x) + Y;
+    let scaled = bessel_k1e_large(x);
     if x < 709.0 {
-        return rat * (-x).exp() / x.sqrt();
+        return scaled * (-x).exp();
     }
 
     let exp_half = (-x / 2.0).exp();
-    rat * exp_half / x.sqrt() * exp_half
+    scaled * exp_half * exp_half
 }
 
-pub(crate) fn bessel_k1_scaled(x: f64) -> f64 {
-    if x <= 0.0 {
-        return f64::INFINITY;
-    }
-
-    if x <= 1.0 {
-        return bessel_k1(x) * x.exp();
-    }
-
+fn bessel_k1e_large(x: f64) -> f64 {
     const Y: f64 = 1.45034217834472656e+00;
 
     const P: [f64; 9] = [
@@ -137,6 +104,18 @@ pub(crate) fn bessel_k1_scaled(x: f64) -> f64 {
     ];
 
     (evaluate_rational(&P, &Q, 1.0 / x) + Y) / x.sqrt()
+}
+
+pub(crate) fn bessel_k1e(x: f64) -> f64 {
+    if x <= 0.0 {
+        return f64::INFINITY;
+    }
+
+    if x <= 1.0 {
+        return bessel_k1(x) * x.exp();
+    }
+
+    bessel_k1e_large(x)
 }
 
 #[cfg(test)]

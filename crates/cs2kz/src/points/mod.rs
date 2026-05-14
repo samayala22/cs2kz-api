@@ -146,8 +146,7 @@ fn fit_distribution(times: &[f64], prev_params: Option<&NigParams>) -> Option<Ni
         return None;
     }
 
-    let result = nig::fit_nig(times, prev_params);
-    if result.valid { Some(result.params) } else { None }
+    nig::fit_nig(times, prev_params)
 }
 
 #[cfg(test)]

@@ -8,9 +8,3 @@ pub struct NigParams {
     pub scale: f64,     // delta
     pub top_scale: f64, // used to normalize the pdf
 }
-
-#[derive(Debug, Clone)]
-pub struct FitResult {
-    pub params: NigParams,
-    pub valid: bool,
-}
