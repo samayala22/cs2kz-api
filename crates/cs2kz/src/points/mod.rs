@@ -22,18 +22,11 @@ pub struct RecordTime {
     pub time: f64,
 }
 
-/// Output record with recalculated distribution points fraction.
-#[derive(Debug, Clone)]
-pub struct RecordPoints {
-    pub record_id: RecordId,
-    pub points: f64,
-}
-
 /// Result of a leaderboard recalculation.
 #[derive(Debug, Clone)]
 pub struct RecalculatedLeaderboard {
     pub leaderboard: LeaderboardData,
-    pub records: Vec<RecordPoints>,
+    pub records: Vec<f64>,
     pub params: Option<NigParams>,
 }
 
@@ -140,10 +133,7 @@ pub fn recalculate_leaderboard(
 
     let recalculated_records = records
         .iter()
-        .map(|record| RecordPoints {
-            record_id: record.record_id,
-            points: calculate_fraction(record.time, &leaderboard),
-        })
+        .map(|record| calculate_fraction(record.time, &leaderboard))
         .collect();
 
     RecalculatedLeaderboard {

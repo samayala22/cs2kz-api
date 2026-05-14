@@ -211,9 +211,9 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
         let mut pro_result =
             points::recalculate_leaderboard(&pro_recs, pro_tier, prev_pro_params.as_ref());
 
-        for (record, recalculated_record) in pro_recs.iter().zip(pro_result.records.iter_mut()) {
+        for (record, recalculated_points) in pro_recs.iter().zip(pro_result.records.iter_mut()) {
             let nub_fraction = points::calculate_fraction(record.time, &nub_result.leaderboard);
-            recalculated_record.points = recalculated_record.points.max(nub_fraction);
+            *recalculated_points = (*recalculated_points).max(nub_fraction);
         }
 
         (nub_result, pro_result)
@@ -304,35 +304,27 @@ async fn upsert_best_records(
     conn: &mut database::Connection,
     insert_prefix: &'static str,
     rows: &[BestRecordRow],
-    recalculated_records: &[points::RecordPoints],
+    recalculated_points: &[f64],
 ) -> Result<(), database::Error> {
-    if rows.len() != recalculated_records.len() {
+    if rows.len() != recalculated_points.len() {
         return Err(database::Error::decode(std::io::Error::other(
             "recalculated record count does not match fetched best record rows",
         )));
     }
 
-    for (row_chunk, recalculated_chunk) in rows
+    for (row_chunk, points_chunk) in rows
         .chunks(UPSERT_CHUNK_SIZE)
-        .zip(recalculated_records.chunks(UPSERT_CHUNK_SIZE))
+        .zip(recalculated_points.chunks(UPSERT_CHUNK_SIZE))
     {
-        for (row, recalculated_record) in row_chunk.iter().zip(recalculated_chunk.iter()) {
-            if row.record_id != recalculated_record.record_id {
-                return Err(database::Error::decode(std::io::Error::other(
-                    "recalculated record order no longer matches fetched best record rows",
-                )));
-            }
-        }
-
         let mut query = database::QueryBuilder::new(insert_prefix);
 
         query.push_values(
-            row_chunk.iter().zip(recalculated_chunk.iter()),
-            |mut query, (row, recalculated_record)| {
+            row_chunk.iter().zip(points_chunk.iter()),
+            |mut query, (row, points)| {
                 query.push_bind(row.filter_id);
                 query.push_bind(row.player_id);
                 query.push_bind(row.record_id);
-                query.push_bind(recalculated_record.points);
+                query.push_bind(points);
                 query.push_bind(row.time);
             },
         );
