@@ -27,7 +27,6 @@ pub struct RecordTime {
 pub struct RecalculatedLeaderboard {
     pub leaderboard: LeaderboardData,
     pub records: Vec<f64>,
-    pub params: Option<NigParams>,
 }
 
 /// The maximum points for any record.
@@ -139,7 +138,6 @@ pub fn recalculate_leaderboard(
     RecalculatedLeaderboard {
         leaderboard,
         records: recalculated_records,
-        params,
     }
 }
 

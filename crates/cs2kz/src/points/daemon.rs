@@ -225,8 +225,8 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
 
     tracing::debug!(
         %filter_id,
-        nub_fitted = nub_result.params.is_some(),
-        pro_fitted = pro_result.params.is_some(),
+        nub_fitted = nub_result.leaderboard.dist_params.is_some(),
+        pro_fitted = pro_result.leaderboard.dist_params.is_some(),
         "recalculation complete, writing to DB"
     );
 
@@ -247,7 +247,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
         )
         .await?;
 
-        if let Some(params) = nub_result.params {
+        if let Some(params) = nub_result.leaderboard.dist_params {
             sqlx::query!(
                 "INSERT INTO PointDistributionData (
                     filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
@@ -270,7 +270,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
             .await?;
         }
 
-        if let Some(params) = pro_result.params {
+        if let Some(params) = pro_result.leaderboard.dist_params {
             sqlx::query!(
                 "INSERT INTO PointDistributionData (
                     filter_id, is_pro_leaderboard, a, b, loc, scale, top_scale
