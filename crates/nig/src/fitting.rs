@@ -17,7 +17,7 @@ fn central_diff(mut f: impl FnMut(f64) -> f64, x0: f64) -> f64 {
     (f(x_plus) - f(x_minus)) / denom
 }
 
-pub fn fit_nig(times: &[f64], prev_params: Option<&NigParams>) -> Option<NigParams> {
+pub fn fit_nig(times: &[f64], prev_params: Option<&NigParams>) -> NigParams {
     let (a, b, loc, scale);
 
     if let Some(prev) = prev_params.filter(|p| p.a > 0.0) {
@@ -32,20 +32,17 @@ pub fn fit_nig(times: &[f64], prev_params: Option<&NigParams>) -> Option<NigPara
         b = estimate_beta(times, loc, scale, a);
     }
 
-    let (a, b, loc, scale) = match optimize_nig(times, a, b, loc, scale) {
-        Ok(params) => params,
-        Err(err) => {
-            tracing::warn!(?err, samples = times.len(), "NIG optimization failed; using initial estimates");
-            (a, b, loc, scale)
-        }
-    };
+    let (a, b, loc, scale) = optimize_nig(times, a, b, loc, scale).unwrap_or_else(|err| {
+        tracing::warn!(?err, samples = times.len(), "NIG optimization failed; using initial estimates");
+        (a, b, loc, scale)
+    });
 
     let top_scale = {
         let sf = nig_survival(a, b, loc, scale, times[0]);
         if sf <= 0.0 { 1.0 } else { sf }
     };
 
-    Some(NigParams { a, b, loc, scale, top_scale })
+    NigParams { a, b, loc, scale, top_scale }
 }
 
 /// Median-based location estimate.
@@ -294,7 +291,7 @@ mod tests {
         let times: Vec<f64> = (0..200)
             .map(|i| 7.0 + (i as f64).powf(1.5) * 0.005)
             .collect();
-        let result = fit_nig(&times, None).expect("expected fit to converge"); 
+        let result = fit_nig(&times, None);
         assert!(result.a > 0.01);
         assert!(result.b.abs() < result.a);
         assert!(result.scale > 1e-6);
@@ -307,8 +304,8 @@ mod tests {
         let times: Vec<f64> = (0..200)
             .map(|i| 7.0 + (i as f64).powf(1.5) * 0.005)
             .collect();
-        let cold_result = fit_nig(&times, None).expect("expected cold fit to converge");
-        let warm_result = fit_nig(&times, Some(&cold_result)).expect("expected warm fit to converge");
+        let cold_result = fit_nig(&times, None);
+        let warm_result = fit_nig(&times, Some(&cold_result));
         assert_abs_close(warm_result.a, cold_result.a, 1.0);
     }
 
@@ -323,7 +320,7 @@ mod tests {
         let b = estimate_beta(&times, loc, scale, a);
         let initial_nll = neg_log_likelihood(&times, a, b, loc, scale);
 
-        let fitted = fit_nig(&times, None).expect("expected fit to converge");
+        let fitted = fit_nig(&times, None);
         let fitted_nll = neg_log_likelihood(&times, fitted.a, fitted.b, fitted.loc, fitted.scale);
 
         assert!(fitted_nll.is_finite());
