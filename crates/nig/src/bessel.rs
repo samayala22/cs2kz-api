@@ -1,5 +1,5 @@
 /// Evaluates the rational function P(z)/Q(z) using Horner's method.
-/// <https://github.com/boostorg/math/blob/develop/include/boost/math/tools/rational.hpp>
+/// https://github.com/boostorg/math/blob/develop/include/boost/math/tools/rational.hpp
 pub(crate) fn evaluate_rational(p: &[f64], q: &[f64], z: f64) -> f64 {
     if p.is_empty() || q.is_empty() {
         return 0.0;

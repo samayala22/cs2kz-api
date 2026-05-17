@@ -14,7 +14,7 @@ use crate::num::AsF64;
 use crate::pagination::{Limit, Offset, Paginated};
 use crate::players::{CalculateRatingError, PlayerId, PlayerInfo};
 use crate::plugin::PluginVersionId;
-use crate::points::{self, NigParams};
+use crate::points::{self, NigData};
 use crate::servers::{ServerId, ServerInfo};
 use crate::styles::{ClientStyleInfo, Styles};
 use crate::time::Seconds;
@@ -285,7 +285,7 @@ pub async fn submit(
             .await?;
 
             let nub_dist = sqlx::query_as!(
-                NigParams,
+                NigData,
                 "SELECT a, b, loc, scale, top_scale
                  FROM PointDistributionData
                  WHERE filter_id = ?
@@ -338,7 +338,7 @@ pub async fn submit(
 
             let pro_data = if teleports == 0 {
                 let pro_dist = sqlx::query_as!(
-                    NigParams,
+                    NigData,
                     "SELECT a, b, loc, scale, top_scale
                      FROM PointDistributionData
                      WHERE filter_id = ?

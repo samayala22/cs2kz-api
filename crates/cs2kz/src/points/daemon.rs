@@ -186,7 +186,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
     // Previous distribution parameters for warm start
     let prev_nub_params = sqlx::query_as!(
         NigParams,
-        "SELECT a, b, loc, scale, top_scale
+        "SELECT a, b, loc, scale
          FROM PointDistributionData
          WHERE filter_id = ? AND (NOT is_pro_leaderboard)",
         filter_id,
@@ -196,7 +196,7 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
 
     let prev_pro_params = sqlx::query_as!(
         NigParams,
-        "SELECT a, b, loc, scale, top_scale
+        "SELECT a, b, loc, scale
          FROM PointDistributionData
          WHERE filter_id = ? AND is_pro_leaderboard",
         filter_id,
@@ -206,10 +206,10 @@ async fn process_filter(cx: &Context, filter_id: CourseFilterId) -> Result<(), d
 
     let (nub_result, pro_result) = tokio::task::spawn_blocking(move || {
         let nub_result =
-            points::recalculate_leaderboard(&nub_recs, nub_tier, prev_nub_params.as_ref());
+            points::recalculate_leaderboard(&nub_recs, nub_tier, prev_nub_params);
 
         let mut pro_result =
-            points::recalculate_leaderboard(&pro_recs, pro_tier, prev_pro_params.as_ref());
+            points::recalculate_leaderboard(&pro_recs, pro_tier, prev_pro_params);
 
         for (record, recalculated_points) in pro_recs.iter().zip(pro_result.records.iter_mut()) {
             let nub_fraction = points::calculate_fraction(record.time, &nub_result.leaderboard);
